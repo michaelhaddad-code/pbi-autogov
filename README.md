@@ -6,7 +6,7 @@ Power BI Data Governance Automation Pipeline. Takes Power BI Project (PBIP) file
 
 1. **Extract Metadata** — parses every visual, field, filter, and measure from a PBIP report
 2. **Generate Catalog** — builds a full inventory of tables, columns, and relationships from TMDL files
-3. **Detect Security Tables** — scans RLS role definitions to find protected tables
+3. **Detect Security Tables** — automatically scans RLS role definitions to find and protect security tables from removal
 4. **Optimize** — cross-references report usage against the catalog to flag unused objects
 5. **Generate Output** — produces DROP SQL for database cleanup and a model cleanup report for TMDL edits
 
@@ -40,4 +40,4 @@ python skills/orchestrator.py \
 
 - **PBIP Report folder** — exported from Power BI Desktop (contains `pages/` and `report.json`)
 - **Semantic Model folder** — exported from Power BI Desktop (contains `tables/` and `relationships.tmdl`)
-- **Views/Security Excel** — manual input listing database views and security table names (sheets: `Views`, `Security Names`)
+- **Views/Security Excel** *(optional)* — lists database views and any additional security tables to protect beyond what the pipeline auto-detects from RLS roles (sheets: `Views`, `Security Names`)
