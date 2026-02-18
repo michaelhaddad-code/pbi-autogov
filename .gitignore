@@ -18,5 +18,7 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Claude Code project files
-.claude/
+# Claude Code — keep skills, ignore transient files
+.claude/*
+!.claude/skills/
+!.claude/settings.local.json
