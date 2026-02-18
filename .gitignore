@@ -1,0 +1,22 @@
+# Generated output files — reproduce by running the pipeline
+output/
+
+# Power BI binary caches
+*.abf
+.pbi/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code project files
+.claude/
