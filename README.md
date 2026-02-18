@@ -1,6 +1,6 @@
 # PBI AutoGov
 
-Power BI Data Governance Automation Pipeline. Takes Power BI Project (PBIP) files as input and identifies unused tables, columns, and measures in your semantic model — then generates the SQL and cleanup reports to remove them.
+Power BI Data Governance Automation Pipeline. Takes Power BI Project (PBIP) files as input and identifies unused tables, columns, and measures in your semantic model, then generates the SQL and cleanup reports to remove them.
 
 ## What It Does
 
