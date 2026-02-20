@@ -26,6 +26,7 @@ pbi-autogov/
 │   ├── filter_lineage.py              # Skill 3: Filter lineage analysis (BFS graph traversal)
 │   ├── detect_security.py             # Skill 4: RLS security table detection
 │   ├── optimization_pipeline.py       # Skill 5: 6-function optimization + DROP SQL + model cleanup
+│   ├── tmdl_cleanup.py               # Skill 7: Direct TMDL file editing (remove unused blocks)
 │   └── orchestrator.py                # Skill 6: Chains all skills in sequence
 ├── data/                              # Input files (PBIP folders, manual Excel)
 └── output/                            # All generated outputs
@@ -37,6 +38,7 @@ pbi-autogov/
 3. **filter_lineage.py** → reads catalog → outputs `Filter_Lineage.xlsx` (2 sheets: Table_Lineage, Measure_Lineage)
 4. **detect_security.py** → reads RLS role definitions → outputs `Security_Tables_Detected.xlsx`
 5. **optimization_pipeline.py** → reads outputs from skills 1-2, 4 + manual Views file → runs 6 functions → outputs DROP SQL files + MODEL_CLEANUP.xlsx
+6. **tmdl_cleanup.py** → reads Function5 output → removes unused column/measure blocks from TMDL files (user-prompted)
 
 ## How to Run Each Skill
 ```bash
@@ -46,6 +48,7 @@ python skills/generate_catalog.py --model-root <path> --output <path>
 python skills/filter_lineage.py --catalog <path> --output <path>
 python skills/detect_security.py --model-root <path> --output <path>
 python skills/optimization_pipeline.py --metadata <path> --catalog <path> --security <path> --views-security <path> --output-dir <path>
+python skills/tmdl_cleanup.py --function5 <path> --tables-dir <path> --mode <tmdl_only|all> --output <path>
 
 # Full pipeline
 python skills/orchestrator.py --report-root <path> --model-root <path> --views-security <path> --output-dir <path>
@@ -95,7 +98,17 @@ The core optimization engine. Runs 6 functions in sequence:
 - **Output:** Function1-6 intermediate Excel files + DROP_TABLES.sql + DROP_COLUMNS.sql + MODEL_CLEANUP.xlsx
 
 ### Skill 6: orchestrator.py
-Chains skills 1→2→3→4→5 in sequence. Validates input paths exist, passes outputs between skills (including auto-feeding Skill 4 security tables into Skill 5), logs progress, reports final summary.
+Chains skills 1→2→3→4→5→7 in sequence. Validates input paths exist, passes outputs between skills (including auto-feeding Skill 4 security tables into Skill 5), prompts user for TMDL cleanup mode, logs progress, reports final summary.
+
+### Skill 7: tmdl_cleanup.py
+Directly removes unused column and measure blocks from TMDL source files.
+- **Input:** Function5_Output.xlsx (from Skill 5), TMDL tables directory
+- **Output:** TMDL_CLEANUP_REPORT.xlsx (2 sheets: Removed, Skipped), modified .tmdl files, .tmdl.bak backups
+- **Modes:**
+  - `tmdl_only` — remove measures (SourceColumn == "[Measure]") and calculated columns (SourceColumn empty)
+  - `all` — remove everything with Remove_column == "Yes" (measures + calculated columns + imported columns)
+- **Key logic:** Reads Function5 as source of truth. For each flagged item, builds a regex to match the column/measure declaration line in the TMDL file, identifies the block range (up to next sibling block), and splices it out. Processes removals bottom-to-top to preserve line indices. Creates .tmdl.bak backups before any edit.
+- **Safety:** Backups always created. Never touches partition, hierarchy, or annotation blocks. Skips items not found (logs warning, doesn't crash).
 
 ## Critical Rules — NEVER BREAK THESE
 1. **NEVER modify original measure names** during extraction — measure names must match exactly as they appear in TMDL files

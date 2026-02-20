@@ -10,6 +10,7 @@ in a single run:
     3. filter_lineage.py    → Filter_Lineage.xlsx
     4. detect_security.py   → Security_Tables_Detected.xlsx
     5. optimization_pipeline.py → Function1-6 + DROP SQL + MODEL_CLEANUP.xlsx
+    6. tmdl_cleanup.py      → Remove unused blocks from TMDL files (optional, user-prompted)
 
 Input:  PBIP report root, semantic model root, Views/Security Excel
 Output: Everything in the output directory
@@ -28,6 +29,7 @@ def run_full_pipeline(
     schema: str = "dbo",
     views_sheet: str = "Views",
     security_sheet: str = "Security Names",
+    tmdl_mode: str = "ask",
 ):
     """Run the complete PBI AutoGov pipeline end-to-end.
 
@@ -39,6 +41,7 @@ def run_full_pipeline(
         schema: Database schema for DROP SQL (default: dbo)
         views_sheet: Sheet name for views in the views_security_file
         security_sheet: Sheet name for security tables in the views_security_file
+        tmdl_mode: TMDL cleanup mode — "ask" (prompt user), "tmdl_only", "all", or "skip"
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -76,7 +79,7 @@ def run_full_pipeline(
 
     # --- Step 1: Extract metadata ---
     print(f"\n{'-' * 60}")
-    print("STEP 1/5: Extracting report metadata")
+    print("STEP 1/6: Extracting report metadata")
     print(f"{'-' * 60}")
 
     from extract_metadata import extract_metadata, export_to_excel
@@ -91,7 +94,7 @@ def run_full_pipeline(
 
     # --- Step 2: Generate catalog ---
     print(f"\n{'-' * 60}")
-    print("STEP 2/5: Generating semantic model catalog")
+    print("STEP 2/6: Generating semantic model catalog")
     print(f"{'-' * 60}")
 
     from generate_catalog import generate_catalog, export_catalog
@@ -106,7 +109,7 @@ def run_full_pipeline(
 
     # --- Step 3: Filter lineage analysis ---
     print(f"\n{'-' * 60}")
-    print("STEP 3/5: Analyzing filter lineage")
+    print("STEP 3/6: Analyzing filter lineage")
     print(f"{'-' * 60}")
 
     from filter_lineage import compute_filter_lineage, export_filter_lineage
@@ -117,7 +120,7 @@ def run_full_pipeline(
 
     # --- Step 4: Detect security tables ---
     print(f"\n{'-' * 60}")
-    print("STEP 4/5: Detecting RLS security tables")
+    print("STEP 4/6: Detecting RLS security tables")
     print(f"{'-' * 60}")
 
     from detect_security import detect_security_tables, export_security_tables
@@ -128,7 +131,7 @@ def run_full_pipeline(
 
     # --- Step 5: Run optimization pipeline ---
     print(f"\n{'-' * 60}")
-    print("STEP 5/5: Running optimization pipeline")
+    print("STEP 5/6: Running optimization pipeline")
     print(f"{'-' * 60}")
 
     from optimization_pipeline import run_pipeline
@@ -146,6 +149,43 @@ def run_full_pipeline(
 
     f1, f2, f3, f4, f5, f6, kept_tables, drop_tables_df, drop_cols_df, model_cleanup_df = results
 
+    # --- Step 6: TMDL Cleanup ---
+    print(f"\n{'-' * 60}")
+    print("STEP 6/6: TMDL Cleanup")
+    print(f"{'-' * 60}")
+
+    tmdl_removed = []
+    tmdl_skipped = []
+
+    # Determine cleanup mode
+    if tmdl_mode == "ask":
+        print("\nClean up TMDL files?")
+        print("  1. Measures and calculated columns only (remove TMDL-only items)")
+        print("  2. Everything (remove all unused items from TMDL)")
+        print("  3. Skip (don't edit TMDL files)")
+        choice = input("\nEnter choice (1/2/3): ").strip()
+        if choice == "1":
+            tmdl_mode = "tmdl_only"
+        elif choice == "2":
+            tmdl_mode = "all"
+        else:
+            tmdl_mode = "skip"
+
+    if tmdl_mode in ("tmdl_only", "all"):
+        from tmdl_cleanup import run_tmdl_cleanup, export_cleanup_report
+
+        tmdl_removed, tmdl_skipped = run_tmdl_cleanup(
+            function5_file=str(out / "Function5_Output.xlsx"),
+            tables_dir=str(tables_dir),
+            mode=tmdl_mode,
+        )
+        export_cleanup_report(
+            tmdl_removed, tmdl_skipped,
+            str(out / "TMDL_CLEANUP_REPORT.xlsx"),
+        )
+    else:
+        print("  Skipping TMDL cleanup.")
+
     # --- Final summary ---
     print(f"\n{'=' * 60}")
     print("FULL PIPELINE COMPLETE")
@@ -160,10 +200,11 @@ def run_full_pipeline(
     print(f"  Tables flagged for removal: {len(drop_tables_df)}")
     print(f"  DB columns flagged for DROP SQL: {len(drop_cols_df)}")
     print(f"  Model items flagged for TMDL cleanup: {len(model_cleanup_df)}")
+    print(f"  TMDL items removed: {len(tmdl_removed)}")
     print(f"  Output directory: {out}")
     print(f"{'=' * 60}")
 
-    return results
+    return results, tmdl_removed, tmdl_skipped
 
 
 # ============================================================
@@ -186,6 +227,8 @@ if __name__ == "__main__":
                         help="Sheet name for views in Views/Security file")
     parser.add_argument("--security-sheet", default="Security Names",
                         help="Sheet name for security in Views/Security file")
+    parser.add_argument("--tmdl-mode", choices=["ask", "tmdl_only", "all", "skip"], default="ask",
+                        help="TMDL cleanup mode: ask (prompt), tmdl_only, all, or skip (default: ask)")
     args = parser.parse_args()
 
     run_full_pipeline(
@@ -196,4 +239,5 @@ if __name__ == "__main__":
         schema=args.schema,
         views_sheet=args.views_sheet,
         security_sheet=args.security_sheet,
+        tmdl_mode=args.tmdl_mode,
     )
