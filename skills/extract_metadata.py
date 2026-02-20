@@ -15,8 +15,14 @@ Output: pbi_report_metadata.xlsx
 import argparse
 import json
 import re
+import sys
+import io
 from pathlib import Path
 from collections import Counter
+
+# Ensure stdout can handle Unicode on Windows (cp1252 can't encode many chars)
+if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import pandas as pd
 
