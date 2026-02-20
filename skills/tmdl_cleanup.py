@@ -126,7 +126,8 @@ def remove_blocks_from_tmdl(
     for start, end in blocks:
         del lines[start:end]
 
-    tmdl_path.write_text("\n".join(lines), encoding="utf-8-sig")
+    # Write without BOM — Power BI Desktop requires UTF-8 without BOM for TMDL files
+    tmdl_path.write_text("\n".join(lines), encoding="utf-8")
 
     return len(removed), removed, skipped
 
