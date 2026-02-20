@@ -565,6 +565,18 @@ def run_tmdl_cleanup(
         print(f"\n  Checking for orphaned variations referencing {len(all_deleted_hierarchies)} deleted hierarchy(ies)...")
         remove_orphaned_variations(tables_path, all_deleted_hierarchies)
 
+    # Delete TMDL files for tables that have no columns or measures left.
+    # After cleanup, if a file has no \tcolumn or \tmeasure lines, it's an empty
+    # shell (just table declaration + partition + annotations) and can be deleted.
+    col_or_measure_re = re.compile(r"^\t(?:column|measure)\s", re.MULTILINE)
+    deleted_tables = []
+    for tmdl_path in sorted(tables_path.glob("*.tmdl")):
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        if not col_or_measure_re.search(content):
+            tmdl_path.unlink()
+            deleted_tables.append(tmdl_path.stem)
+            print(f"  Deleted empty table file: {tmdl_path.name}")
+
     # Summary
     measure_count = sum(1 for r in all_removed if r.get("item_type") == "Measure")
     calc_count = sum(1 for r in all_removed if r.get("item_type") == "Calculated Column")
@@ -579,6 +591,8 @@ def run_tmdl_cleanup(
         print(f"    Calculated columns: {calc_count}")
     if imported_count:
         print(f"    Imported columns: {imported_count}")
+    if deleted_tables:
+        print(f"    Empty tables deleted: {len(deleted_tables)}")
     if all_skipped:
         print(f"  Skipped: {len(all_skipped)} (see report for details)")
     print(f"{'=' * 60}")
