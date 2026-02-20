@@ -14,7 +14,9 @@ Modes:
 Safety:
     - Creates .tmdl.bak backup before editing any file
     - Logs every removal and skip
-    - Never touches partition, hierarchy, annotation blocks or the table declaration
+    - Cascade-removes hierarchies that reference deleted columns
+    - Cascade-removes variation sub-blocks that reference deleted hierarchies (cross-file)
+    - Never touches partition or annotation blocks at table level, or the table declaration
 
 Input:  Function5_Output.xlsx, TMDL tables directory
 Output: TMDL_CLEANUP_REPORT.xlsx (2 sheets: Removed, Skipped)
@@ -59,6 +61,39 @@ def find_block_range(lines: List[str], start_idx: int) -> Tuple[int, int]:
     return start_idx, end_idx
 
 
+def find_variation_range(lines: List[str], start_idx: int) -> Tuple[int, int]:
+    """Find the line range of a variation sub-block within a column.
+
+    Variation blocks sit at \\t\\t level inside column blocks.
+    Scans forward until the next \\t\\t-level sibling, \\t-level block, or EOF.
+    Trailing blank lines are included in the range so removal is clean.
+
+    Args:
+        lines: All lines in the TMDL file.
+        start_idx: Index of the ``\\t\\tvariation`` declaration line.
+
+    Returns:
+        (start_idx, end_idx) — the sub-block spans lines[start_idx:end_idx].
+    """
+    end_idx = start_idx + 1
+    while end_idx < len(lines):
+        line = lines[end_idx]
+        if line.strip() == "":
+            # Blank line — consume it (it's a separator between sub-blocks)
+            end_idx += 1
+            continue
+        if line.startswith("\t\t\t"):
+            # Deeper content (part of variation block)
+            end_idx += 1
+        elif line.startswith("\t\t") or (line.startswith("\t") and not line.startswith("\t\t")):
+            # Sibling at \t\t level or parent at \t level — stop
+            break
+        else:
+            # Table-level or less — stop
+            break
+    return start_idx, end_idx
+
+
 # ============================================================
 # Block removal from a single TMDL file
 # ============================================================
@@ -81,7 +116,9 @@ def remove_blocks_from_tmdl(
             table (str): Table name (for reporting).
 
     Returns:
-        (removed_count, removed_items, skipped_items)
+        (removed_count, removed_items, skipped_items, deleted_hierarchies)
+        where deleted_hierarchies is a set of qualified names like
+        "TableName.'Date Hierarchy'" for cross-file variation cleanup.
     """
     content = tmdl_path.read_text(encoding="utf-8-sig")
     lines = content.split("\n")
@@ -114,7 +151,43 @@ def remove_blocks_from_tmdl(
             print(f"  WARNING: {item['block_type']} '{item['name']}' not found in {tmdl_path.name}")
 
     if not blocks:
-        return 0, removed, skipped
+        return 0, removed, skipped, set()
+
+    # Cascade: find hierarchy blocks that reference any removed column.
+    # If a hierarchy level points to a column we're deleting, the hierarchy
+    # must also be removed — otherwise PBI Desktop rejects the broken reference.
+    removed_col_names = {item["name"] for item in removed if item["block_type"] == "column"}
+    if removed_col_names:
+        hierarchy_re = re.compile(r"^\thierarchy\s+")
+        # level column references sit at 3-tab depth: \t\t\tcolumn: Name
+        col_ref_re = re.compile(r"^\t\t\tcolumn:\s*(.+)$")
+        existing_starts = {b[0] for b in blocks}
+
+        for i, line in enumerate(lines):
+            if hierarchy_re.match(line) and i not in existing_starts:
+                h_start, h_end = find_block_range(lines, i)
+                # Check if any level in this hierarchy references a removed column
+                for j in range(h_start, h_end):
+                    col_match = col_ref_re.match(lines[j])
+                    if col_match:
+                        ref_name = col_match.group(1).strip().strip("'")
+                        if ref_name in removed_col_names:
+                            blocks.append((h_start, h_end))
+                            print(f"    Cascade: removing hierarchy (references deleted column '{ref_name}')")
+                            break
+
+    # Extract qualified names of deleted hierarchies (for cross-file variation cleanup).
+    # Must happen BEFORE lines are spliced so we can read the declaration lines.
+    deleted_hierarchies = set()
+    # Match: \thierarchy 'Date Hierarchy'  or  \thierarchy DateHierarchy
+    hierarchy_name_re = re.compile(r"^\thierarchy\s+'?(.+?)'?\s*$")
+    table_name = tmdl_path.stem  # filename without .tmdl
+    for start, end in blocks:
+        h_match = hierarchy_name_re.match(lines[start])
+        if h_match:
+            h_name = h_match.group(1)
+            qualified = f"{table_name}.'{h_name}'"
+            deleted_hierarchies.add(qualified)
 
     # Create backup before editing
     backup_path = tmdl_path.with_suffix(".tmdl.bak")
@@ -129,7 +202,118 @@ def remove_blocks_from_tmdl(
     # Write without BOM — Power BI Desktop requires UTF-8 without BOM for TMDL files
     tmdl_path.write_text("\n".join(lines), encoding="utf-8")
 
-    return len(removed), removed, skipped
+    return len(removed), removed, skipped, deleted_hierarchies
+
+
+# ============================================================
+# Cross-file variation cleanup
+# ============================================================
+
+def remove_orphaned_variations(
+    tables_dir: Path,
+    deleted_hierarchies: set,
+):
+    """Remove variation sub-blocks whose defaultHierarchy points to a deleted hierarchy.
+
+    Variation blocks sit inside column blocks at \\t\\t level and reference
+    hierarchies in OTHER tables via ``defaultHierarchy: TableName.'HierarchyName'``.
+    When that hierarchy has been cascade-removed, the variation must also go
+    or PBI Desktop will reject the broken reference.
+
+    Also strips the ``showAsVariationsOnly`` property from any table that is
+    no longer the target of any variation — PBI Desktop requires that tables
+    with this flag are referenced by at least one variation block.
+
+    Args:
+        tables_dir: Path to the semantic model tables/ directory.
+        deleted_hierarchies: Set of qualified hierarchy names
+            (e.g. ``"LocalDateTable_xxx.'Date Hierarchy'"``).
+    """
+    if not deleted_hierarchies:
+        return
+
+    # \t\tvariation Variation  (sub-block within a column)
+    variation_re = re.compile(r"^\t\tvariation\s+")
+    # \t\t\tdefaultHierarchy: TableName.'HierarchyName'
+    default_h_re = re.compile(r"^\t\t\tdefaultHierarchy:\s*(.+)$")
+
+    for tmdl_path in sorted(tables_dir.glob("*.tmdl")):
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        blocks_to_remove = []
+
+        for i, line in enumerate(lines):
+            if variation_re.match(line):
+                v_start, v_end = find_variation_range(lines, i)
+                # Check if defaultHierarchy references a deleted hierarchy
+                for j in range(v_start, v_end):
+                    dh_match = default_h_re.match(lines[j])
+                    if dh_match:
+                        ref = dh_match.group(1).strip()
+                        if ref in deleted_hierarchies:
+                            blocks_to_remove.append((v_start, v_end))
+                            print(f"    Cascade: removing variation in {tmdl_path.name} "
+                                  f"(references deleted hierarchy '{ref}')")
+                            break
+
+        if not blocks_to_remove:
+            continue
+
+        # Backup if not already backed up (file may have been edited in the main pass)
+        backup_path = tmdl_path.with_suffix(".tmdl.bak")
+        if not backup_path.exists():
+            shutil.copy2(tmdl_path, backup_path)
+            print(f"  Backup: {backup_path.name}")
+
+        # Remove bottom-to-top
+        blocks_to_remove.sort(key=lambda x: x[0], reverse=True)
+        for start, end in blocks_to_remove:
+            del lines[start:end]
+
+        tmdl_path.write_text("\n".join(lines), encoding="utf-8")
+
+    # --- Strip showAsVariationsOnly from tables no longer targeted by any variation ---
+    # PBI Desktop requires: if showAsVariationsOnly=1, the table must be referenced
+    # by at least one variation's defaultHierarchy somewhere in the model.
+    # Extract table names from deleted hierarchies (part before the first dot)
+    potentially_orphaned = set()
+    for h in deleted_hierarchies:
+        table_name = h.split(".", 1)[0]
+        potentially_orphaned.add(table_name)
+
+    if not potentially_orphaned:
+        return
+
+    # Scan ALL TMDL files for remaining defaultHierarchy references to these tables
+    still_referenced = set()
+    for tmdl_path in tables_dir.glob("*.tmdl"):
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        for tname in potentially_orphaned:
+            if f"defaultHierarchy: {tname}." in content:
+                still_referenced.add(tname)
+
+    truly_orphaned = potentially_orphaned - still_referenced
+    for tname in sorted(truly_orphaned):
+        table_file = tables_dir / f"{tname}.tmdl"
+        if not table_file.is_file():
+            continue
+
+        content = table_file.read_text(encoding="utf-8-sig")
+        if "\tshowAsVariationsOnly" not in content:
+            continue
+
+        # Backup if not already backed up
+        backup_path = table_file.with_suffix(".tmdl.bak")
+        if not backup_path.exists():
+            shutil.copy2(table_file, backup_path)
+            print(f"  Backup: {backup_path.name}")
+
+        # Remove the showAsVariationsOnly line
+        lines = content.split("\n")
+        lines = [l for l in lines if l.strip() != "showAsVariationsOnly"]
+        table_file.write_text("\n".join(lines), encoding="utf-8")
+        print(f"    Stripped showAsVariationsOnly from {table_file.name} (no longer a variation target)")
 
 
 # ============================================================
@@ -196,6 +380,7 @@ def run_tmdl_cleanup(
 
     all_removed = []
     all_skipped = []
+    all_deleted_hierarchies = set()
 
     for table_name, group in to_remove.groupby("TableName"):
         tmdl_file = tables_path / f"{table_name}.tmdl"
@@ -223,12 +408,20 @@ def run_tmdl_cleanup(
                 "block_type": block_type,
             })
 
-        count, removed, skipped = remove_blocks_from_tmdl(tmdl_file, items)
+        count, removed, skipped, deleted_hierarchies = remove_blocks_from_tmdl(tmdl_file, items)
         all_removed.extend(removed)
         all_skipped.extend(skipped)
+        all_deleted_hierarchies.update(deleted_hierarchies)
 
         if count > 0:
             print(f"  {tmdl_file.name}: removed {count} item(s)")
+
+    # Cross-file cascade: remove variation sub-blocks that reference deleted hierarchies.
+    # Variations sit inside KEPT columns in OTHER files and have defaultHierarchy
+    # pointing to a hierarchy that was cascade-deleted above.
+    if all_deleted_hierarchies:
+        print(f"\n  Checking for orphaned variations referencing {len(all_deleted_hierarchies)} deleted hierarchy(ies)...")
+        remove_orphaned_variations(tables_path, all_deleted_hierarchies)
 
     # Summary
     measure_count = sum(1 for r in all_removed if r.get("item_type") == "Measure")
