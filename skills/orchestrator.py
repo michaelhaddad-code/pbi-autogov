@@ -7,8 +7,9 @@ Chains all skills in sequence to go from raw PBIP files to DROP SQL + model clea
 in a single run:
     1. extract_metadata.py  → pbi_report_metadata.xlsx
     2. generate_catalog.py  → Gold_Layer_Tables_Columns.xlsx
-    3. detect_security.py   → Security_Tables_Detected.xlsx
-    4. optimization_pipeline.py → Function1-6 + DROP SQL + MODEL_CLEANUP.xlsx
+    3. filter_lineage.py    → Filter_Lineage.xlsx
+    4. detect_security.py   → Security_Tables_Detected.xlsx
+    5. optimization_pipeline.py → Function1-6 + DROP SQL + MODEL_CLEANUP.xlsx
 
 Input:  PBIP report root, semantic model root, Views/Security Excel
 Output: Everything in the output directory
@@ -75,7 +76,7 @@ def run_full_pipeline(
 
     # --- Step 1: Extract metadata ---
     print(f"\n{'-' * 60}")
-    print("STEP 1/4: Extracting report metadata")
+    print("STEP 1/5: Extracting report metadata")
     print(f"{'-' * 60}")
 
     from extract_metadata import extract_metadata, export_to_excel
@@ -90,7 +91,7 @@ def run_full_pipeline(
 
     # --- Step 2: Generate catalog ---
     print(f"\n{'-' * 60}")
-    print("STEP 2/4: Generating semantic model catalog")
+    print("STEP 2/5: Generating semantic model catalog")
     print(f"{'-' * 60}")
 
     from generate_catalog import generate_catalog, export_catalog
@@ -103,9 +104,20 @@ def run_full_pipeline(
 
     export_catalog(tables_df, columns_df, relations_df, catalog_path)
 
-    # --- Step 3: Detect security tables ---
+    # --- Step 3: Filter lineage analysis ---
     print(f"\n{'-' * 60}")
-    print("STEP 3/4: Detecting RLS security tables")
+    print("STEP 3/5: Analyzing filter lineage")
+    print(f"{'-' * 60}")
+
+    from filter_lineage import compute_filter_lineage, export_filter_lineage
+
+    lineage_path = str(out / "Filter_Lineage.xlsx")
+    table_lineage_df, measure_lineage_df = compute_filter_lineage(catalog_path)
+    export_filter_lineage(table_lineage_df, measure_lineage_df, lineage_path)
+
+    # --- Step 4: Detect security tables ---
+    print(f"\n{'-' * 60}")
+    print("STEP 4/5: Detecting RLS security tables")
     print(f"{'-' * 60}")
 
     from detect_security import detect_security_tables, export_security_tables
@@ -114,9 +126,9 @@ def run_full_pipeline(
     security_tables = detect_security_tables(str(semantic_model_dir))
     export_security_tables(security_tables, security_path)
 
-    # --- Step 4: Run optimization pipeline ---
+    # --- Step 5: Run optimization pipeline ---
     print(f"\n{'-' * 60}")
-    print("STEP 4/4: Running optimization pipeline")
+    print("STEP 5/5: Running optimization pipeline")
     print(f"{'-' * 60}")
 
     from optimization_pipeline import run_pipeline
@@ -138,8 +150,12 @@ def run_full_pipeline(
     print(f"\n{'=' * 60}")
     print("FULL PIPELINE COMPLETE")
     print(f"{'=' * 60}")
+    lineage_reachable = table_lineage_df[table_lineage_df["Hops"] > 0]
+    measure_reachable = measure_lineage_df[measure_lineage_df["Hops"] > 0]
+
     print(f"  Metadata rows extracted: {len(df_metadata)}")
     print(f"  Catalog: {len(tables_df)} tables, {len(columns_df)} columns, {len(relations_df)} relationships")
+    print(f"  Filter lineage: {len(lineage_reachable)} table pairs, {len(measure_reachable)} measure pairs")
     print(f"  Security tables detected: {len(security_tables)}")
     print(f"  Tables flagged for removal: {len(drop_tables_df)}")
     print(f"  DB columns flagged for DROP SQL: {len(drop_cols_df)}")

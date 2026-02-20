@@ -5,6 +5,7 @@ Automates Power BI report documentation and semantic model governance. Takes PBI
 - A complete metadata extract of every visual, field, filter, and measure in a report
 - A semantic model catalog (tables, columns, relationships)
 - Auto-detected security tables from RLS roles
+- A filter lineage analysis showing which tables can filter which measures through relationship chains
 - An optimization analysis that flags unused columns and tables
 - DROP SQL (both DROP TABLE and DROP COLUMN) for safe database cleanup
 - A model cleanup report for unused measures and calculated columns (TMDL-only items)
@@ -22,9 +23,10 @@ pbi-autogov/
 ├── skills/
 │   ├── extract_metadata.py            # Skill 1: PBIP metadata extraction
 │   ├── generate_catalog.py            # Skill 2: Semantic model catalog generation
-│   ├── detect_security.py             # Skill 3: RLS security table detection
-│   ├── optimization_pipeline.py       # Skill 4: 6-function optimization + DROP SQL + model cleanup
-│   └── orchestrator.py                # Skill 5: Chains all skills in sequence
+│   ├── filter_lineage.py              # Skill 3: Filter lineage analysis (BFS graph traversal)
+│   ├── detect_security.py             # Skill 4: RLS security table detection
+│   ├── optimization_pipeline.py       # Skill 5: 6-function optimization + DROP SQL + model cleanup
+│   └── orchestrator.py                # Skill 6: Chains all skills in sequence
 ├── data/                              # Input files (PBIP folders, manual Excel)
 └── output/                            # All generated outputs
 ```
@@ -32,14 +34,16 @@ pbi-autogov/
 ## Pipeline Flow (run in this order)
 1. **extract_metadata.py** → reads PBIP report JSON + TMDL files → outputs `pbi_report_metadata.xlsx`
 2. **generate_catalog.py** → reads TMDL files → outputs `Gold_Layer_Tables_Columns.xlsx` (3 sheets: Tables, Columns, Relations)
-3. **detect_security.py** → reads RLS role definitions → outputs `Security_Tables_Detected.xlsx`
-4. **optimization_pipeline.py** → reads outputs from skills 1-3 + manual Views file → runs 6 functions → outputs DROP SQL files + MODEL_CLEANUP.xlsx
+3. **filter_lineage.py** → reads catalog → outputs `Filter_Lineage.xlsx` (2 sheets: Table_Lineage, Measure_Lineage)
+4. **detect_security.py** → reads RLS role definitions → outputs `Security_Tables_Detected.xlsx`
+5. **optimization_pipeline.py** → reads outputs from skills 1-2, 4 + manual Views file → runs 6 functions → outputs DROP SQL files + MODEL_CLEANUP.xlsx
 
 ## How to Run Each Skill
 ```bash
 # Individual skills
 python skills/extract_metadata.py --report-root <path> --model-root <path> --output <path>
 python skills/generate_catalog.py --model-root <path> --output <path>
+python skills/filter_lineage.py --catalog <path> --output <path>
 python skills/detect_security.py --model-root <path> --output <path>
 python skills/optimization_pipeline.py --metadata <path> --catalog <path> --security <path> --views-security <path> --output-dir <path>
 
@@ -61,16 +65,24 @@ Parses TMDL files to build a full inventory of the semantic model.
 - **Output:** Gold_Layer_Tables_Columns.xlsx with 3 sheets:
   - Tables (ID, Name)
   - Columns (ID, ExplicitName, SourceColumn, TableID)
-  - Relations (FromTableID, FromColumnID, ToTableID, ToColumnID)
-- **Key logic:** Auto-generates numeric IDs. Measures are included in the Columns sheet with SourceColumn = '[Measure]'.
+  - Relations (FromTableID, FromColumnID, ToTableID, ToColumnID, CrossFilteringBehavior, IsActive)
+- **Key logic:** Auto-generates numeric IDs. Measures are included in the Columns sheet with SourceColumn = '[Measure]'. Relationships now capture filter direction and active status.
 
-### Skill 3: detect_security.py
+### Skill 3: filter_lineage.py
+Analyzes filter propagation through the semantic model's relationship graph via BFS.
+- **Input:** Gold_Layer_Tables_Columns.xlsx (catalog from Skill 2)
+- **Output:** Filter_Lineage.xlsx with 2 sheets:
+  - Table_Lineage (Table, Filtered_By_Table, Hops)
+  - Measure_Lineage (MeasureName, HomeTable, Filtered_By_Table, Hops)
+- **Key logic:** Builds a directed graph from relationships (toTable→fromTable for default, both ways for bothDirections). Skips inactive relationships. BFS with visited set computes transitive closure. Measures inherit their home table's filter sources. Isolated tables/measures get a single `(none)` / Hops `-1` row.
+
+### Skill 4: detect_security.py
 Scans RLS role definitions to find security tables.
 - **Input:** Semantic model root path (looks for definition/roles/*.tmdl)
 - **Output:** Security_Tables_Detected.xlsx (single column: TableName)
 - **Key logic:** Uses regex to find tablePermission patterns in role TMDL files. If no roles folder exists, returns empty set.
 
-### Skill 4: optimization_pipeline.py
+### Skill 5: optimization_pipeline.py
 The core optimization engine. Runs 6 functions in sequence:
 - **F1** report_field_usage: Aggregates usage counts (Slicer/Visual/Filter/Measure) per Table$$Column
 - **F2** relationship_columns_resolver: Maps relationship IDs to table/column names
@@ -79,11 +91,11 @@ The core optimization engine. Runs 6 functions in sequence:
 - **F5** flag_columns_to_remove: Merges F3+F4, Remove=Yes when both flags=0, applies view/security protections
 - **F6** flag_tables_to_remove: Groups by table, Remove=Yes when ALL columns flagged for removal
 - Then generates DROP TABLE SQL, DROP COLUMN SQL (imported columns only), and a model cleanup report (measures + calculated columns)
-- **Input:** metadata Excel (Skill 1), catalog Excel (Skill 2), security Excel (Skill 3), Views/Security Excel (manual)
+- **Input:** metadata Excel (Skill 1), catalog Excel (Skill 2), security Excel (Skill 4), Views/Security Excel (manual)
 - **Output:** Function1-6 intermediate Excel files + DROP_TABLES.sql + DROP_COLUMNS.sql + MODEL_CLEANUP.xlsx
 
-### Skill 5: orchestrator.py
-Chains skills 1→2→3→4 in sequence. Validates input paths exist, passes outputs between skills (including auto-feeding Skill 3 security tables into Skill 4), logs progress, reports final summary.
+### Skill 6: orchestrator.py
+Chains skills 1→2→3→4→5 in sequence. Validates input paths exist, passes outputs between skills (including auto-feeding Skill 4 security tables into Skill 5), logs progress, reports final summary.
 
 ## Critical Rules — NEVER BREAK THESE
 1. **NEVER modify original measure names** during extraction — measure names must match exactly as they appear in TMDL files

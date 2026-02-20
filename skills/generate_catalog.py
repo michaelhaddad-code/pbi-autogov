@@ -180,15 +180,28 @@ def parse_relationships(rel_file: Path, table_name_to_id: dict, col_lookup: dict
             print(f"  WARNING: Unresolved relationship: {', '.join(missing)}")
             continue
 
+        # Extract crossFilteringBehavior (default: oneDirection)
+        cross_filter_match = re.search(
+            r"crossFilteringBehavior:\s*(\S+)", block,
+        )
+        cross_filter = cross_filter_match.group(1) if cross_filter_match else "oneDirection"
+
+        # Extract isActive flag (default: True — omitted means active)
+        is_active_match = re.search(r"isActive:\s*(\S+)", block)
+        is_active = is_active_match.group(1).lower() != "false" if is_active_match else True
+
         relationships.append({
             "FromTableID": from_table_id,
             "FromColumnID": from_col_id,
             "ToTableID": to_table_id,
             "ToColumnID": to_col_id,
+            "CrossFilteringBehavior": cross_filter,
+            "IsActive": is_active,
         })
 
     return pd.DataFrame(relationships, columns=[
         "FromTableID", "FromColumnID", "ToTableID", "ToColumnID",
+        "CrossFilteringBehavior", "IsActive",
     ])
 
 
