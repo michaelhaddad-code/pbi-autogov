@@ -108,7 +108,9 @@ Directly removes unused column and measure blocks from TMDL source files.
   - `tmdl_only` — remove measures (SourceColumn == "[Measure]") and calculated columns (SourceColumn empty)
   - `all` — remove everything with Remove_column == "Yes" (measures + calculated columns + imported columns)
 - **Key logic:** Reads Function5 as source of truth. For each flagged item, builds a regex to match the column/measure declaration line in the TMDL file, identifies the block range (up to next sibling block), and splices it out. Processes removals bottom-to-top to preserve line indices. Creates .tmdl.bak backups before any edit.
-- **Safety:** Backups always created. Never touches partition, hierarchy, or annotation blocks. Skips items not found (logs warning, doesn't crash).
+- **Safety:** Backups always created. Never touches partition or annotation blocks. Skips items not found (logs warning, doesn't crash).
+- **Cascade logic:** When columns are removed, hierarchies referencing those columns are also removed. When hierarchies are removed, variation sub-blocks in other files referencing those hierarchies are also removed. When a table loses all its variation references, its `showAsVariationsOnly` property is stripped.
+- **Structural protection:** Columns that support date hierarchies, variations, and sort-by references are automatically protected even if flagged as unused. The protection chain is: kept column with variation → protects referenced hierarchy → protects hierarchy level columns (Year, Quarter, Month, Day) → protects sortByColumn targets (MonthNo, QuarterNo). These columns will remain in the model and appear as "unused calculated columns" in subsequent pipeline runs — this is expected and correct. They cannot be removed without breaking PBI Desktop.
 
 ## Critical Rules — NEVER BREAK THESE
 1. **NEVER modify original measure names** during extraction — measure names must match exactly as they appear in TMDL files
@@ -119,6 +121,7 @@ Directly removes unused column and measure blocks from TMDL source files.
 6. **Key_Column normalization must be consistent** — always case-insensitive, whitespace-trimmed, using $$ as separator (Table$$Column)
 7. **Circular measure references must not cause infinite loops** — the visited set in resolve_measure_dependencies() prevents this
 8. **Auto-generated visual-level filters that duplicate query state fields must be skipped** — prevents double-counting
+9. **NEVER remove columns that support kept hierarchies, variations, or sortByColumn references** — if a kept column has a variation pointing to a hierarchy, that hierarchy and ALL its level columns AND their sortByColumn targets must be protected from removal. Breaking this chain crashes PBI Desktop with SortByColumn/hierarchy/variation errors.
 
 ## Known Issues (do not try to fix unless asked)
 1. ~~DROP SQL doesn't separate real columns from calculated columns/measures~~ **RESOLVED:** DROP_COLUMNS.sql now only contains imported columns; measures and calculated columns go to MODEL_CLEANUP.xlsx

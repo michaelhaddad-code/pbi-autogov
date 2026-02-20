@@ -338,6 +338,128 @@ def _classify_item(row) -> Tuple[str, str]:
 
 
 # ============================================================
+# Variation-aware protection
+# ============================================================
+
+def _find_protected_hierarchy_columns(
+    tables_path: Path,
+    to_remove_set: set,
+) -> set:
+    """Find columns that must be protected because they support hierarchies
+    referenced by variations in kept columns.
+
+    When a kept column (e.g. DateTable.Date) has a variation pointing to a
+    hierarchy in another table (e.g. LocalDateTable_xxx.'Date Hierarchy'),
+    the hierarchy and all columns it references (Year, Quarter, Month, Day)
+    must be protected from removal — otherwise PBI Desktop loses the date
+    drill-down capability.
+
+    Args:
+        tables_path: Path to TMDL tables directory.
+        to_remove_set: Set of ``"TableName$$ColumnName"`` keys flagged for removal.
+
+    Returns:
+        Set of ``"TableName$$ColumnName"`` keys that must be protected.
+    """
+    protected = set()
+
+    # Pattern matchers
+    # Match: \tcolumn 'Name'  or  \tcolumn Name  or  \tcolumn Name = DAX
+    column_re = re.compile(r"^\tcolumn\s+'?(.+?)'?\s*(?:=.*)?$")
+    variation_re = re.compile(r"^\t\tvariation\s+")
+    default_h_re = re.compile(r"^\t\t\tdefaultHierarchy:\s*(.+)$")
+    hierarchy_re = re.compile(r"^\thierarchy\s+'?(.+?)'?\s*$")
+    # \t\t\tcolumn: Name  (level column reference inside a hierarchy)
+    col_ref_re = re.compile(r"^\t\t\tcolumn:\s*(.+)$")
+    # Sibling-level blocks at \t indentation (used to track current column scope)
+    sibling_re = re.compile(r"^\t(?:column|measure|hierarchy|partition|annotation)\s")
+
+    # Step 1: Find variations in KEPT columns → collect protected hierarchy references
+    protected_hierarchies = set()  # "TableName.'HierarchyName'" strings
+
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        current_column = None
+        for i, line in enumerate(lines):
+            col_match = column_re.match(line)
+            if col_match:
+                current_column = col_match.group(1)
+            elif sibling_re.match(line) and not line.lstrip("\t").startswith("column "):
+                # Non-column sibling block — reset scope
+                current_column = None
+
+            if variation_re.match(line) and current_column is not None:
+                key = f"{table_name}$${current_column}"
+                if key not in to_remove_set:
+                    # This column is KEPT — its variation's hierarchy must be protected
+                    v_start, v_end = find_variation_range(lines, i)
+                    for j in range(v_start, v_end):
+                        dh_match = default_h_re.match(lines[j])
+                        if dh_match:
+                            protected_hierarchies.add(dh_match.group(1).strip())
+                            break
+
+    if not protected_hierarchies:
+        return protected
+
+    # Step 2: For each protected hierarchy, protect its level columns from removal
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        for i, line in enumerate(lines):
+            h_match = hierarchy_re.match(line)
+            if h_match:
+                h_name = h_match.group(1)
+                qualified = f"{table_name}.'{h_name}'"
+                if qualified in protected_hierarchies:
+                    # Hierarchy is protected — protect its column references
+                    h_start, h_end = find_block_range(lines, i)
+                    for j in range(h_start, h_end):
+                        cr_match = col_ref_re.match(lines[j])
+                        if cr_match:
+                            ref_col = cr_match.group(1).strip().strip("'")
+                            protected.add(f"{table_name}$${ref_col}")
+
+    # Step 3: Protect sortByColumn targets of any protected column.
+    # E.g. Month (protected) has sortByColumn: MonthNo → MonthNo must also be kept.
+    # \t\tsortByColumn: ColumnName  (at \t\t level inside a column block)
+    sort_by_re = re.compile(r"^\t\tsortByColumn:\s*(.+)$")
+    newly_protected = set()
+
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        current_column = None
+        for line in lines:
+            col_match = column_re.match(line)
+            if col_match:
+                current_column = col_match.group(1)
+            elif sibling_re.match(line) and not line.lstrip("\t").startswith("column "):
+                current_column = None
+
+            if current_column is not None:
+                col_key = f"{table_name}$${current_column}"
+                # Check both originally-kept columns AND hierarchy-protected columns
+                if col_key in protected or col_key not in to_remove_set:
+                    sb_match = sort_by_re.match(line)
+                    if sb_match:
+                        sort_col = sb_match.group(1).strip().strip("'")
+                        sort_key = f"{table_name}$${sort_col}"
+                        if sort_key in to_remove_set and sort_key not in protected:
+                            newly_protected.add(sort_key)
+
+    protected.update(newly_protected)
+    return protected
+
+
+# ============================================================
 # Main cleanup entry point
 # ============================================================
 
@@ -374,6 +496,26 @@ def run_tmdl_cleanup(
 
     if to_remove.empty:
         print("  No items to remove from TMDL files.")
+        return [], []
+
+    # Protect columns that support hierarchies referenced by kept columns' variations.
+    # E.g. LocalDateTable.Year must be kept if DateTable.Date (kept) has a variation
+    # pointing to LocalDateTable.'Date Hierarchy' which references Year.
+    to_remove_set = {
+        f"{row['TableName']}$${row['ColumnName']}" for _, row in to_remove.iterrows()
+    }
+    protected_cols = _find_protected_hierarchy_columns(tables_path, to_remove_set)
+    if protected_cols:
+        before = len(to_remove)
+        to_remove = to_remove[
+            ~to_remove.apply(
+                lambda r: f"{r['TableName']}$${r['ColumnName']}" in protected_cols, axis=1
+            )
+        ]
+        print(f"  Protected {before - len(to_remove)} column(s) supporting active date hierarchies")
+
+    if to_remove.empty:
+        print("  No items to remove from TMDL files (all protected).")
         return [], []
 
     print(f"  Items to remove: {len(to_remove)}")
