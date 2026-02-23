@@ -163,6 +163,9 @@ def remove_blocks_from_tmdl(
         col_ref_re = re.compile(r"^\t\t\tcolumn:\s*(.+)$")
         existing_starts = {b[0] for b in blocks}
 
+        # Match: \thierarchy 'Name'  or  \thierarchy Name
+        h_name_re = re.compile(r"^\thierarchy\s+'?(.+?)'?\s*$")
+
         for i, line in enumerate(lines):
             if hierarchy_re.match(line) and i not in existing_starts:
                 h_start, h_end = find_block_range(lines, i)
@@ -173,6 +176,15 @@ def remove_blocks_from_tmdl(
                         ref_name = col_match.group(1).strip().strip("'")
                         if ref_name in removed_col_names:
                             blocks.append((h_start, h_end))
+                            # Extract hierarchy name for the removed list
+                            h_match = h_name_re.match(line)
+                            h_label = h_match.group(1) if h_match else "(unknown)"
+                            removed.append({
+                                "table": tmdl_path.stem,
+                                "name": h_label,
+                                "item_type": "Hierarchy (cascade)",
+                                "block_type": "hierarchy",
+                            })
                             print(f"    Cascade: removing hierarchy (references deleted column '{ref_name}')")
                             break
 
@@ -212,7 +224,7 @@ def remove_blocks_from_tmdl(
 def remove_orphaned_variations(
     tables_dir: Path,
     deleted_hierarchies: set,
-):
+) -> List[Dict]:
     """Remove variation sub-blocks whose defaultHierarchy points to a deleted hierarchy.
 
     Variation blocks sit inside column blocks at \\t\\t level and reference
@@ -228,12 +240,17 @@ def remove_orphaned_variations(
         tables_dir: Path to the semantic model tables/ directory.
         deleted_hierarchies: Set of qualified hierarchy names
             (e.g. ``"LocalDateTable_xxx.'Date Hierarchy'"``).
+
+    Returns:
+        List of removed item dicts (for inclusion in the cleanup report).
     """
+    cascade_removed = []
+
     if not deleted_hierarchies:
-        return
+        return cascade_removed
 
     # \t\tvariation Variation  (sub-block within a column)
-    variation_re = re.compile(r"^\t\tvariation\s+")
+    variation_re = re.compile(r"^\t\tvariation\s+'?(.+?)'?\s*$")
     # \t\t\tdefaultHierarchy: TableName.'HierarchyName'
     default_h_re = re.compile(r"^\t\t\tdefaultHierarchy:\s*(.+)$")
 
@@ -244,7 +261,8 @@ def remove_orphaned_variations(
         blocks_to_remove = []
 
         for i, line in enumerate(lines):
-            if variation_re.match(line):
+            v_match = variation_re.match(line)
+            if v_match:
                 v_start, v_end = find_variation_range(lines, i)
                 # Check if defaultHierarchy references a deleted hierarchy
                 for j in range(v_start, v_end):
@@ -253,6 +271,12 @@ def remove_orphaned_variations(
                         ref = dh_match.group(1).strip()
                         if ref in deleted_hierarchies:
                             blocks_to_remove.append((v_start, v_end))
+                            cascade_removed.append({
+                                "table": tmdl_path.stem,
+                                "name": v_match.group(1),
+                                "item_type": "Variation (cascade)",
+                                "block_type": "variation",
+                            })
                             print(f"    Cascade: removing variation in {tmdl_path.name} "
                                   f"(references deleted hierarchy '{ref}')")
                             break
@@ -283,7 +307,7 @@ def remove_orphaned_variations(
         potentially_orphaned.add(table_name)
 
     if not potentially_orphaned:
-        return
+        return cascade_removed
 
     # Scan ALL TMDL files for remaining defaultHierarchy references to these tables
     still_referenced = set()
@@ -314,6 +338,8 @@ def remove_orphaned_variations(
         lines = [l for l in lines if l.strip() != "showAsVariationsOnly"]
         table_file.write_text("\n".join(lines), encoding="utf-8")
         print(f"    Stripped showAsVariationsOnly from {table_file.name} (no longer a variation target)")
+
+    return cascade_removed
 
 
 # ============================================================
@@ -563,7 +589,8 @@ def run_tmdl_cleanup(
     # pointing to a hierarchy that was cascade-deleted above.
     if all_deleted_hierarchies:
         print(f"\n  Checking for orphaned variations referencing {len(all_deleted_hierarchies)} deleted hierarchy(ies)...")
-        remove_orphaned_variations(tables_path, all_deleted_hierarchies)
+        cascade_items = remove_orphaned_variations(tables_path, all_deleted_hierarchies)
+        all_removed.extend(cascade_items)
 
     # Delete TMDL files for tables that have no columns or measures left.
     # After cleanup, if a file has no \tcolumn or \tmeasure lines, it's an empty
@@ -575,12 +602,21 @@ def run_tmdl_cleanup(
         if not col_or_measure_re.search(content):
             tmdl_path.unlink()
             deleted_tables.append(tmdl_path.stem)
+            all_removed.append({
+                "table": tmdl_path.stem,
+                "name": "(entire table)",
+                "item_type": "Empty Table Deleted",
+                "block_type": "table",
+            })
             print(f"  Deleted empty table file: {tmdl_path.name}")
 
     # Summary
     measure_count = sum(1 for r in all_removed if r.get("item_type") == "Measure")
     calc_count = sum(1 for r in all_removed if r.get("item_type") == "Calculated Column")
     imported_count = sum(1 for r in all_removed if r.get("item_type") == "Imported Column")
+    hierarchy_count = sum(1 for r in all_removed if r.get("item_type") == "Hierarchy (cascade)")
+    variation_count = sum(1 for r in all_removed if r.get("item_type") == "Variation (cascade)")
+    empty_table_count = sum(1 for r in all_removed if r.get("item_type") == "Empty Table Deleted")
 
     print(f"\n{'=' * 60}")
     print(f"TMDL Cleanup complete!")
@@ -591,8 +627,12 @@ def run_tmdl_cleanup(
         print(f"    Calculated columns: {calc_count}")
     if imported_count:
         print(f"    Imported columns: {imported_count}")
-    if deleted_tables:
-        print(f"    Empty tables deleted: {len(deleted_tables)}")
+    if hierarchy_count:
+        print(f"    Hierarchies (cascade): {hierarchy_count}")
+    if variation_count:
+        print(f"    Variations (cascade): {variation_count}")
+    if empty_table_count:
+        print(f"    Empty tables deleted: {empty_table_count}")
     if all_skipped:
         print(f"  Skipped: {len(all_skipped)} (see report for details)")
 
