@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Skill 5: orchestrator.py
+Skill 6: orchestrator.py
 PBI AutoGov — Power BI Data Governance Automation Pipeline
 
-Chains all skills in sequence to go from raw PBIP files to DROP SQL + model cleanup
-in a single run:
+Chains all skills in sequence to go from raw PBIP (or .pbix) files to
+DROP SQL + model cleanup in a single run:
+    0. pbix_extractor.py    → Convert .pbix to PBIP structure (optional, via --pbix)
     1. extract_metadata.py  → pbi_report_metadata.xlsx
     2. generate_catalog.py  → Gold_Layer_Tables_Columns.xlsx
     3. filter_lineage.py    → Filter_Lineage.xlsx
@@ -12,7 +13,7 @@ in a single run:
     5. optimization_pipeline.py → Function1-6 + DROP SQL + MODEL_CLEANUP.xlsx
     6. tmdl_cleanup.py      → Remove unused blocks from TMDL files (optional, user-prompted)
 
-Input:  PBIP report root, semantic model root, Views/Security Excel
+Input:  PBIP report root + semantic model root (or .pbix file), Views/Security Excel
 Output: Everything in the output directory
 """
 
@@ -22,14 +23,16 @@ from pathlib import Path
 
 
 def run_full_pipeline(
-    report_root: str,
-    model_root: str,
-    views_security_file: str,
+    report_root: str = "",
+    model_root: str = "",
+    views_security_file: str = "",
     output_dir: str = "output",
     schema: str = "dbo",
     views_sheet: str = "Views",
     security_sheet: str = "Security Names",
     tmdl_mode: str = "ask",
+    pbix_path: str = "",
+    extract_dir: str = "",
 ):
     """Run the complete PBI AutoGov pipeline end-to-end.
 
@@ -42,18 +45,53 @@ def run_full_pipeline(
         views_sheet: Sheet name for views in the views_security_file
         security_sheet: Sheet name for security tables in the views_security_file
         tmdl_mode: TMDL cleanup mode — "ask" (prompt user), "tmdl_only", "all", or "skip"
+        pbix_path: Path to .pbix file (runs Skill 0 extraction first, overrides report_root/model_root)
+        extract_dir: Directory for .pbix extraction output (default: output_dir)
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the semantic model root for Skill 3 (needs parent of definition/)
-    # model_root points to .../definition, Skill 3 needs .../SemanticModel
-    model_root_path = Path(model_root)
-    semantic_model_dir = model_root_path.parent if model_root_path.name == "definition" else model_root_path
-
     print("=" * 60)
     print("PBI AutoGov — Full Pipeline")
     print("=" * 60)
+
+    # --- Step 0 (optional): Extract .pbix to PBIP ---
+    if pbix_path:
+        print(f"\n{'-' * 60}")
+        print("STEP 0: Extracting .pbix to PBIP format")
+        print(f"{'-' * 60}")
+
+        from pbix_extractor import extract_pbix
+
+        target_dir = extract_dir if extract_dir else str(out)
+        result = extract_pbix(pbix_path, target_dir)
+
+        if not result.report_root:
+            raise ValueError(f"PBIX extraction failed: no report root from {pbix_path}")
+
+        report_root = result.report_root
+        if result.model_root:
+            model_root = result.model_root
+            print(f"  Report root:  {report_root}")
+            print(f"  Model root:   {model_root}")
+            print(f"  Model source: {result.semantic_model_source}")
+            print(f"  Pages: {result.page_count}, Data visuals: {result.data_visual_count}")
+        else:
+            raise ValueError(
+                f"PBIX extraction could not extract the semantic model from {pbix_path}. "
+                "Ensure pbixray is installed: pip install pbixray"
+            )
+
+    # Validate we have paths (either from --pbix or from CLI args)
+    if not report_root or not model_root:
+        raise ValueError(
+            "Must provide either --pbix or both --report-root and --model-root"
+        )
+
+    # Resolve the semantic model root for Skill 4 (needs parent of definition/)
+    # model_root points to .../definition, Skill 4 needs .../SemanticModel
+    model_root_path = Path(model_root)
+    semantic_model_dir = model_root_path.parent if model_root_path.name == "definition" else model_root_path
 
     # --- Validate inputs ---
     report_root_path = Path(report_root)
@@ -213,10 +251,17 @@ def run_full_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PBI AutoGov — Full Pipeline Orchestrator")
-    parser.add_argument("--report-root", required=True,
+
+    # Input source: either --pbix OR (--report-root + --model-root)
+    parser.add_argument("--pbix", default="",
+                        help="Path to .pbix file (auto-extracts to PBIP, replaces --report-root/--model-root)")
+    parser.add_argument("--extract-dir", default="",
+                        help="Directory for .pbix extraction output (default: same as --output-dir)")
+    parser.add_argument("--report-root", default="",
                         help="Path to PBIP report definition root (contains pages/, report.json)")
-    parser.add_argument("--model-root", required=True,
+    parser.add_argument("--model-root", default="",
                         help="Path to semantic model definition root (contains tables/)")
+
     parser.add_argument("--views-security", required=True,
                         help="Path to Views/Security Excel (manual input)")
     parser.add_argument("--output-dir", default="output",
@@ -231,6 +276,10 @@ if __name__ == "__main__":
                         help="TMDL cleanup mode: ask (prompt), tmdl_only, all, or skip (default: ask)")
     args = parser.parse_args()
 
+    # Validate: need either --pbix or both --report-root and --model-root
+    if not args.pbix and (not args.report_root or not args.model_root):
+        parser.error("Must provide either --pbix or both --report-root and --model-root")
+
     run_full_pipeline(
         report_root=args.report_root,
         model_root=args.model_root,
@@ -240,4 +289,6 @@ if __name__ == "__main__":
         views_sheet=args.views_sheet,
         security_sheet=args.security_sheet,
         tmdl_mode=args.tmdl_mode,
+        pbix_path=args.pbix,
+        extract_dir=args.extract_dir,
     )
