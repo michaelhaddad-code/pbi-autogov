@@ -913,8 +913,22 @@ def query_columns(handler, table_ids: list) -> pd.DataFrame:
     if ok:
         return df
 
-    # Tier 2: Without IsNameInferred/InferredName and SortByColumn self-join
-    # (these columns don't exist in all PBIX SQLite schemas)
+    # Tier 2a: Without IsNameInferred and SortByColumn, but keep InferredName
+    # (IsNameInferred doesn't exist in all PBIX SQLite schemas, but InferredName
+    # is needed to resolve names for Type 4 calc-table columns like Date)
+    sql = f"""
+        SELECT c.ID, c.TableID, c.ExplicitName, c.InferredName, c.Type,
+               c.ExplicitDataType, c.SourceColumn, c.Expression, c.FormatString,
+               c.IsHidden, c.SummarizeBy, c.DataCategory, c.LineageTag
+        FROM [Column] c
+        WHERE c.Type != 3 AND c.TableID IN ({ids_str})
+    """
+    df, ok = _query(handler, sql)
+    if ok:
+        logger.info("Column query: using Tier 2a (no SortByColumn/IsNameInferred, has InferredName)")
+        return df
+
+    # Tier 2b: Without IsNameInferred, InferredName, and SortByColumn
     sql = f"""
         SELECT c.ID, c.TableID, c.ExplicitName, c.Type,
                c.ExplicitDataType, c.SourceColumn, c.Expression, c.FormatString,
@@ -924,7 +938,7 @@ def query_columns(handler, table_ids: list) -> pd.DataFrame:
     """
     df, ok = _query(handler, sql)
     if ok:
-        logger.info("Column query: using Tier 2 (no SortByColumn/IsNameInferred)")
+        logger.info("Column query: using Tier 2b (no SortByColumn/IsNameInferred/InferredName)")
         return df
 
     # Tier 3: Core columns only (SourceColumn/FormatString may also be missing)
@@ -1023,8 +1037,8 @@ def query_relationships(handler) -> pd.DataFrame:
     """Query all relationships with table/column name resolution."""
     sql = """
         SELECT r.ID, r.Name AS RelName,
-               ft.Name AS FromTableName, fc.ExplicitName AS FromColumnName,
-               tt.Name AS ToTableName, tc.ExplicitName AS ToColumnName,
+               ft.Name AS FromTableName, COALESCE(fc.ExplicitName, fc.InferredName) AS FromColumnName,
+               tt.Name AS ToTableName, COALESCE(tc.ExplicitName, tc.InferredName) AS ToColumnName,
                r.IsActive, r.CrossFilteringBehavior, r.JoinOnDateBehavior
         FROM [Relationship] r
         LEFT JOIN [Table] ft ON r.FromTableID = ft.ID
@@ -1037,8 +1051,8 @@ def query_relationships(handler) -> pd.DataFrame:
         # Fallback: without JoinOnDateBehavior and Relationship.Name
         sql = """
             SELECT r.ID,
-                   ft.Name AS FromTableName, fc.ExplicitName AS FromColumnName,
-                   tt.Name AS ToTableName, tc.ExplicitName AS ToColumnName,
+                   ft.Name AS FromTableName, COALESCE(fc.ExplicitName, fc.InferredName) AS FromColumnName,
+                   tt.Name AS ToTableName, COALESCE(tc.ExplicitName, tc.InferredName) AS ToColumnName,
                    r.IsActive, r.CrossFilteringBehavior
             FROM [Relationship] r
             LEFT JOIN [Table] ft ON r.FromTableID = ft.ID
@@ -1162,12 +1176,20 @@ def _emit_column(c: pd.Series, col_variations: pd.DataFrame,
     lines = []
     col_type = _safe_int(c.get("Type"), 1)
 
-    # Determine display name
+    # Determine display name — prefer ExplicitName, fall back to InferredName
+    # (Type 4 calc-table columns like Date often only have InferredName)
     is_name_inferred = _safe_bool(c.get("IsNameInferred"))
     if is_name_inferred and _safe_str(c.get("InferredName")):
         name = _safe_str(c["InferredName"])
     else:
         name = _safe_str(c.get("ExplicitName", ""))
+    if not name:
+        name = _safe_str(c.get("InferredName", ""))
+
+    # Skip phantom columns with no resolvable name — internal artifacts
+    # from empty calculated tables (partition = {0}) that PBI Desktop omits
+    if not name:
+        return []
 
     # Declaration line
     if col_type == 2:
