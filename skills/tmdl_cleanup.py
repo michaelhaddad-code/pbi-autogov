@@ -624,6 +624,10 @@ def _find_protected_dax_reference_columns(
     meas_decl_re = re.compile(r"^\tmeasure\s+'?(.+?)'?\s*=")
     # Table[Column] references in DAX
     dax_ref_re = re.compile(r"'?(\w[\w\s]*?)'?\s*\[([^\]]+)\]")
+    # Unqualified [Column] references — no table prefix.
+    # Matches [Col] NOT preceded by word char or quote (i.e. not Table[Col]).
+    # These refer to the current table in TMDL context.
+    dax_unqualified_re = re.compile(r"(?<!['\w])\[([^\]]+)\]")
 
     for tmdl_path in tables_path.glob("*.tmdl"):
         table_name = tmdl_path.stem
@@ -649,10 +653,19 @@ def _find_protected_dax_reference_columns(
                         break
                 dax_text = " ".join(dax_lines)
 
+                # Find qualified Table[Column] references
                 for ref_table, ref_col in dax_ref_re.findall(dax_text):
                     ref_key = f"{ref_table.strip()}$${ref_col.strip()}"
                     if ref_key.lower() in removal_norm:
-                        # Find the original-case key from to_remove_set
+                        for orig_key in to_remove_set:
+                            if orig_key.lower() == ref_key.lower():
+                                protected.add(orig_key)
+                                break
+
+                # Find unqualified [Column] references — resolve to current table
+                for ref_col in dax_unqualified_re.findall(dax_text):
+                    ref_key = f"{table_name}$${ref_col.strip()}"
+                    if ref_key.lower() in removal_norm:
                         for orig_key in to_remove_set:
                             if orig_key.lower() == ref_key.lower():
                                 protected.add(orig_key)

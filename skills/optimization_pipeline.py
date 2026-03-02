@@ -500,6 +500,10 @@ def function5_flag_columns_to_remove(
                     meas_decl_re = re.compile(r"^\tmeasure\s+'?(.+?)'?\s*=")
                     # Table[Column] references in DAX — handles 'Table Name'[Col] and Table[Col]
                     dax_ref_re = re.compile(r"'?(\w[\w\s]*?)'?\s*\[([^\]]+)\]")
+                    # Unqualified [Column] references in DAX — no table prefix.
+                    # Matches [Col] NOT preceded by word char or quote (i.e. not Table[Col]).
+                    # These refer to the current table in TMDL context.
+                    dax_unqualified_re = re.compile(r"(?<!['\w])\[([^\]]+)\]")
 
                     dax_protected = set()  # normalized keys to protect
                     for tmdl_path in tables_path.glob("*.tmdl"):
@@ -528,11 +532,18 @@ def function5_flag_columns_to_remove(
                                         break
                                 dax_text = " ".join(dax_lines)
 
-                                # Find column references in DAX
+                                # Find qualified Table[Column] references in DAX
                                 for ref_table, ref_col in dax_ref_re.findall(dax_text):
                                     ref_table = ref_table.strip()
                                     ref_col = ref_col.strip()
                                     ref_key = f"{ref_table.lower()}$${ref_col.lower()}"
+                                    if ref_key in removal_keys_norm:
+                                        dax_protected.add(ref_key)
+
+                                # Find unqualified [Column] references — resolve to current table
+                                for ref_col in dax_unqualified_re.findall(dax_text):
+                                    ref_col = ref_col.strip()
+                                    ref_key = f"{tbl.lower()}$${ref_col.lower()}"
                                     if ref_key in removal_keys_norm:
                                         dax_protected.add(ref_key)
 
