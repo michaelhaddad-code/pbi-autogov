@@ -23,6 +23,7 @@ Output: TMDL_CLEANUP_REPORT.xlsx (2 sheets: Removed, Skipped)
 """
 
 import argparse
+import json
 import re
 import shutil
 from pathlib import Path
@@ -486,6 +487,250 @@ def _find_protected_hierarchy_columns(
 
 
 # ============================================================
+# Semantic link protection (Step 4)
+# ============================================================
+
+def _find_protected_semantic_link_columns(
+    tables_path: Path,
+    to_remove_set: set,
+) -> set:
+    """Find columns that must be protected because they are targets of
+    __PBI_SemanticLinks annotations on kept columns.
+
+    When a kept column (e.g. Opportunities.'Days Remaining In Pipeline')
+    has a ``__PBI_SemanticLinks`` annotation pointing to another column
+    (e.g. 'Days Remaining In Pipeline (bins)'), removing the target
+    crashes PBI Desktop with ``ColumnDoesntExistInModel``.
+
+    This is the same class of structural dependency as hierarchies/variations.
+
+    Args:
+        tables_path: Path to TMDL tables directory.
+        to_remove_set: Set of ``"TableName$$ColumnName"`` keys flagged for removal.
+
+    Returns:
+        Set of ``"TableName$$ColumnName"`` keys that must be protected.
+    """
+    protected = set()
+
+    # Patterns to track which column block we're inside
+    # Match: \tcolumn 'Name'  or  \tcolumn Name  or  \tcolumn Name = DAX
+    column_re = re.compile(r"^\tcolumn\s+'?(.+?)'?\s*(?:=.*)?$")
+    sibling_re = re.compile(r"^\t(?:column|measure|hierarchy|partition|annotation)\s")
+    # Match: \t\tannotation __PBI_SemanticLinks = [...]
+    semantic_link_re = re.compile(
+        r"^\t\tannotation\s+__PBI_SemanticLinks\s*=\s*(.+)$"
+    )
+
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        current_column = None
+        for line in lines:
+            col_match = column_re.match(line)
+            if col_match:
+                current_column = col_match.group(1)
+            elif sibling_re.match(line) and not line.lstrip("\t").startswith("column "):
+                current_column = None
+
+            if current_column is None:
+                continue
+
+            sl_match = semantic_link_re.match(line)
+            if not sl_match:
+                continue
+
+            # Check if the source column is KEPT (not in removal set)
+            source_key = f"{table_name}$${current_column}"
+            if source_key in to_remove_set:
+                continue  # Source column is being removed — target doesn't need protection
+
+            # Parse JSON to extract link targets
+            raw_json = sl_match.group(1).strip()
+            try:
+                links = json.loads(raw_json)
+            except json.JSONDecodeError:
+                print(f"  WARNING: Could not parse __PBI_SemanticLinks JSON in "
+                      f"{tmdl_path.name} for column '{current_column}'")
+                continue
+
+            if not isinstance(links, list):
+                links = [links]
+
+            for link in links:
+                target = link.get("LinkTarget", {})
+                target_table = target.get("TableName", "").strip()
+                target_item = target.get("TableItemName", "").strip()
+                if target_table and target_item:
+                    target_key = f"{target_table}$${target_item}"
+                    if target_key in to_remove_set:
+                        protected.add(target_key)
+
+    return protected
+
+
+# ============================================================
+# DAX reference protection (Step 5)
+# ============================================================
+
+def _find_protected_dax_reference_columns(
+    tables_path: Path,
+    to_remove_set: set,
+    f5_df: pd.DataFrame,
+) -> set:
+    """Find columns that must be protected because they are referenced in
+    DAX formulas of kept calculated columns or measures.
+
+    When a kept calculated column (e.g. Weeks Open) uses Table[Column]
+    in its DAX formula, removing the referenced column causes PBI Desktop
+    to show 'error in expression' for the calculated column.
+
+    Args:
+        tables_path: Path to TMDL tables directory.
+        to_remove_set: Set of ``"TableName$$ColumnName"`` keys flagged for removal.
+        f5_df: Function5 DataFrame (used to identify kept calculated columns/measures).
+
+    Returns:
+        Set of ``"TableName$$ColumnName"`` keys that must be protected.
+    """
+    protected = set()
+
+    # Identify kept calculated columns (SourceColumn empty, Remove=No)
+    src = f5_df["SourceColumn"].fillna("").astype(str).str.strip()
+    remove_flag = f5_df["Remove_column"].astype(str).str.strip().str.lower()
+    kept_calc = f5_df[(src == "") & (remove_flag == "no")]
+    kept_calc_set = set(
+        (str(r["TableName"]).strip(), str(r["ColumnName"]).strip())
+        for _, r in kept_calc.iterrows()
+    )
+
+    # Also protect for kept measures
+    kept_measures = f5_df[(src == "[Measure]") & (remove_flag == "no")]
+    kept_measure_set = set(
+        (str(r["TableName"]).strip(), str(r["ColumnName"]).strip())
+        for _, r in kept_measures.iterrows()
+    )
+
+    if not kept_calc_set and not kept_measure_set:
+        return protected
+
+    # Normalize removal set for case-insensitive matching
+    removal_norm = {k.lower() for k in to_remove_set}
+
+    # Patterns
+    calc_decl_re = re.compile(r"^\tcolumn\s+'?(.+?)'?\s*=")
+    meas_decl_re = re.compile(r"^\tmeasure\s+'?(.+?)'?\s*=")
+    # Table[Column] references in DAX
+    dax_ref_re = re.compile(r"'?(\w[\w\s]*?)'?\s*\[([^\]]+)\]")
+
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        i = 0
+        while i < len(lines):
+            cm = calc_decl_re.match(lines[i])
+            is_calc = cm and (table_name, cm.group(1)) in kept_calc_set
+            mm = meas_decl_re.match(lines[i])
+            is_meas = mm and (table_name, mm.group(1)) in kept_measure_set
+
+            if is_calc or is_meas:
+                # Collect DAX block
+                dax_lines = [lines[i]]
+                j = i + 1
+                while j < len(lines):
+                    if lines[j].startswith("\t\t") or lines[j].strip() == "":
+                        dax_lines.append(lines[j])
+                        j += 1
+                    else:
+                        break
+                dax_text = " ".join(dax_lines)
+
+                for ref_table, ref_col in dax_ref_re.findall(dax_text):
+                    ref_key = f"{ref_table.strip()}$${ref_col.strip()}"
+                    if ref_key.lower() in removal_norm:
+                        # Find the original-case key from to_remove_set
+                        for orig_key in to_remove_set:
+                            if orig_key.lower() == ref_key.lower():
+                                protected.add(orig_key)
+                                break
+
+                i = j
+            else:
+                i += 1
+
+    return protected
+
+
+# ============================================================
+# Hierarchy level sibling protection (Step 6)
+# ============================================================
+
+def _find_protected_hierarchy_level_siblings(
+    tables_path: Path,
+    to_remove_set: set,
+) -> set:
+    """Find columns that must be protected because they are sibling levels
+    in a hierarchy where at least one other level column is kept.
+
+    PBI Desktop requires ALL hierarchy level columns to exist. If any one
+    level is kept (e.g. Account Name in Street Hierarchy is Used_in_PBI=1),
+    then ALL sibling levels (State or Province, Country) must also be kept.
+
+    Args:
+        tables_path: Path to TMDL tables directory.
+        to_remove_set: Set of ``"TableName$$ColumnName"`` keys flagged for removal.
+
+    Returns:
+        Set of ``"TableName$$ColumnName"`` keys that must be protected.
+    """
+    protected = set()
+
+    hierarchy_re = re.compile(r"^\thierarchy\s+'?(.+?)'?\s*$")
+    col_ref_re = re.compile(r"^\t\t\tcolumn:\s*(.+)$")
+    sibling_re = re.compile(r"^\t(?:column|measure|hierarchy|partition|annotation)\s")
+
+    for tmdl_path in tables_path.glob("*.tmdl"):
+        table_name = tmdl_path.stem
+        content = tmdl_path.read_text(encoding="utf-8-sig")
+        lines = content.split("\n")
+
+        for i, line in enumerate(lines):
+            if not hierarchy_re.match(line):
+                continue
+
+            # Find hierarchy block range
+            h_end = i + 1
+            while h_end < len(lines):
+                if sibling_re.match(lines[h_end]) and h_end != i:
+                    break
+                h_end += 1
+
+            # Collect all level columns
+            level_cols = []
+            for j in range(i, h_end):
+                cr = col_ref_re.match(lines[j])
+                if cr:
+                    level_cols.append(cr.group(1).strip().strip("'"))
+
+            # If any level column is KEPT, protect all siblings that are in removal set
+            any_kept = any(
+                f"{table_name}$${c}" not in to_remove_set
+                for c in level_cols
+            )
+            if any_kept:
+                for c in level_cols:
+                    key = f"{table_name}$${c}"
+                    if key in to_remove_set:
+                        protected.add(key)
+
+    return protected
+
+
+# ============================================================
 # Main cleanup entry point
 # ============================================================
 
@@ -531,14 +776,45 @@ def run_tmdl_cleanup(
         f"{row['TableName']}$${row['ColumnName']}" for _, row in to_remove.iterrows()
     }
     protected_cols = _find_protected_hierarchy_columns(tables_path, to_remove_set)
+
+    # Protect columns that are targets of __PBI_SemanticLinks annotations on kept columns.
+    # E.g. 'Days Remaining In Pipeline (bins)' must be kept if 'Days Remaining In Pipeline'
+    # (kept) has a semantic link pointing to it — removing the target crashes PBI Desktop.
+    semantic_link_protected = _find_protected_semantic_link_columns(tables_path, to_remove_set)
+    protected_cols.update(semantic_link_protected)
+    if semantic_link_protected:
+        print(f"  Protected {len(semantic_link_protected)} column(s) targeted by __PBI_SemanticLinks")
+
+    # Protect columns referenced by kept calculated columns' or measures' DAX formulas.
+    # E.g. 'Opportunity Created On' must be kept if 'Weeks Open' (kept calc column) uses
+    # Opportunities[Opportunity Created On] in its DAX — removing it breaks the formula.
+    dax_ref_protected = _find_protected_dax_reference_columns(tables_path, to_remove_set, f5)
+    protected_cols.update(dax_ref_protected)
+    if dax_ref_protected:
+        print(f"  Protected {len(dax_ref_protected)} column(s) referenced by kept DAX formulas")
+
+    # Protect hierarchy level siblings: if ANY level column in a hierarchy is kept,
+    # ALL sibling level columns must also be kept. PBI Desktop requires all hierarchy
+    # levels to exist — removing one breaks the drill-down.
+    hierarchy_level_protected = _find_protected_hierarchy_level_siblings(tables_path, to_remove_set)
+    protected_cols.update(hierarchy_level_protected)
+    if hierarchy_level_protected:
+        print(f"  Protected {len(hierarchy_level_protected)} column(s) as sibling hierarchy levels of kept columns")
+
     if protected_cols:
         before = len(to_remove)
+        # Capture protected rows for the Skipped report before filtering them out
+        protected_rows = to_remove[
+            to_remove.apply(
+                lambda r: f"{r['TableName']}$${r['ColumnName']}" in protected_cols, axis=1
+            )
+        ]
         to_remove = to_remove[
             ~to_remove.apply(
                 lambda r: f"{r['TableName']}$${r['ColumnName']}" in protected_cols, axis=1
             )
         ]
-        print(f"  Protected {before - len(to_remove)} column(s) supporting active date hierarchies")
+        print(f"  Protected {before - len(to_remove)} column(s) total (date hierarchies + semantic links)")
 
     if to_remove.empty:
         print("  No items to remove from TMDL files (all protected).")
@@ -548,6 +824,27 @@ def run_tmdl_cleanup(
 
     all_removed = []
     all_skipped = []
+
+    # Add structurally protected items to skipped list with clear reasons
+    if protected_cols:
+        for _, row in protected_rows.iterrows():
+            item_type, block_type = _classify_item(row)
+            key = f"{row['TableName']}$${row['ColumnName']}"
+            if key in dax_ref_protected:
+                reason = "DAX reference — used in a kept calculated column or measure formula"
+            elif key in semantic_link_protected:
+                reason = "SemanticLink target — referenced by kept column via __PBI_SemanticLinks"
+            elif key in hierarchy_level_protected:
+                reason = "Hierarchy level sibling — another level in same hierarchy is kept"
+            else:
+                reason = "Supports Date Hierarchy via variation chain — removing crashes PBI Desktop"
+            all_skipped.append({
+                "table": str(row["TableName"]),
+                "name": str(row["ColumnName"]),
+                "item_type": item_type,
+                "block_type": block_type,
+                "reason": reason,
+            })
     all_deleted_hierarchies = set()
 
     for table_name, group in to_remove.groupby("TableName"):
@@ -639,20 +936,56 @@ def run_tmdl_cleanup(
     # Explain items that could NOT be deleted and why
     not_deletable = []
     # 1. Protected hierarchy/sortByColumn columns (LocalDateTables)
-    if protected_cols:
-        # Group by table for cleaner output
+    hierarchy_protected = protected_cols - semantic_link_protected - dax_ref_protected - hierarchy_level_protected
+    if hierarchy_protected:
         from collections import defaultdict
         prot_by_table = defaultdict(list)
-        for key in sorted(protected_cols):
+        for key in sorted(hierarchy_protected):
             tbl, col = key.split("$$", 1)
             prot_by_table[tbl].append(col)
         not_deletable.append(
-            f"    Date hierarchy columns ({len(protected_cols)} columns in "
+            f"    Date hierarchy columns ({len(hierarchy_protected)} columns in "
             f"{len(prot_by_table)} tables): PBI Desktop requires these for date "
             f"drill-down (Year/Quarter/Month/Day + sortByColumn targets MonthNo/QuarterNo). "
             f"They support variations in kept date columns."
         )
-    # 2. Implicit Value columns in measure-only tables
+    # 2. Protected semantic link target columns (binned/grouped columns)
+    if semantic_link_protected:
+        from collections import defaultdict
+        sl_by_table = defaultdict(list)
+        for key in sorted(semantic_link_protected):
+            tbl, col = key.split("$$", 1)
+            sl_by_table[tbl].append(col)
+        not_deletable.append(
+            f"    Semantic link targets ({len(semantic_link_protected)} columns in "
+            f"{len(sl_by_table)} tables): Referenced by __PBI_SemanticLinks annotations "
+            f"on kept columns (e.g. binned/grouped columns). Removing crashes PBI Desktop."
+        )
+    # 3. Protected DAX reference columns (used in kept calc column / measure formulas)
+    if dax_ref_protected:
+        from collections import defaultdict
+        dax_by_table = defaultdict(list)
+        for key in sorted(dax_ref_protected):
+            tbl, col = key.split("$$", 1)
+            dax_by_table[tbl].append(col)
+        not_deletable.append(
+            f"    DAX reference columns ({len(dax_ref_protected)} columns in "
+            f"{len(dax_by_table)} tables): Referenced in DAX formulas of kept "
+            f"calculated columns or measures. Removing breaks those formulas."
+        )
+    # 4. Protected hierarchy level sibling columns
+    if hierarchy_level_protected:
+        from collections import defaultdict
+        hl_by_table = defaultdict(list)
+        for key in sorted(hierarchy_level_protected):
+            tbl, col = key.split("$$", 1)
+            hl_by_table[tbl].append(col)
+        not_deletable.append(
+            f"    Hierarchy level siblings ({len(hierarchy_level_protected)} columns in "
+            f"{len(hl_by_table)} tables): Sibling levels in hierarchies where another "
+            f"level is kept. PBI Desktop requires all hierarchy levels to exist."
+        )
+    # 5. Implicit Value columns in measure-only tables
     src = f5["SourceColumn"].fillna("").astype(str).str.strip()
     value_rows = f5[(f5["ColumnName"].astype(str).str.strip() == "Value") & (src == "[Value]")]
     if not value_rows.empty:

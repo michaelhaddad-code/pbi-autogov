@@ -1309,7 +1309,7 @@ def _emit_hierarchy(hier_rows: pd.DataFrame, annotations: list) -> list:
             lines.append(f"\t\t\tlineageTag: {lvl_tag}")
         col_name = _safe_str(lvl.get("LevelColumnName"))
         if col_name:
-            lines.append(f"\t\t\tcolumn: {col_name}")
+            lines.append(f"\t\t\tcolumn: {tmdl_quote(col_name)}")
 
     # Annotations (e.g., TemplateId = DateHierarchy)
     for ann_name, ann_val in annotations:

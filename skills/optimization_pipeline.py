@@ -22,6 +22,7 @@ Output: Function1-6 intermediate Excel files + DROP_TABLES.sql + DROP_COLUMNS.sq
 """
 
 import argparse
+import json
 import re
 from pathlib import Path
 from typing import Optional, Tuple, Set
@@ -337,10 +338,16 @@ def function5_flag_columns_to_remove(
     output_xlsx_path: Optional[str] = None,
     protected_view_columns: Optional[Set[str]] = None,
     protected_security_tables: Optional[Set[str]] = None,
+    tables_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """Merge F3 + F4 and flag columns for removal.
     Remove = Yes when Used_in_PBI = 0 AND Used_in_Relationship = 0.
-    Protected view columns and security tables override removal.
+    Protected view columns, security tables, and semantic link targets override removal.
+
+    Args:
+        tables_dir: Optional path to TMDL tables directory. When provided,
+            scans for __PBI_SemanticLinks annotations and protects target
+            columns referenced by kept columns (e.g. binned/grouped columns).
     """
     required_f3 = {"ColumnID", "Used_in_PBI", "TableName", "ColumnName"}
     required_f4 = {"ColumnID", "Used_in_Relationship"}
@@ -387,6 +394,210 @@ def function5_flag_columns_to_remove(
 
     # Protected = Yes overrides Remove = Yes
     df.loc[df["Protected"] == "Yes", "Remove_column"] = "No"
+
+    # Scan TMDL files for __PBI_SemanticLinks annotations (if tables_dir provided).
+    # When a KEPT column has a semantic link pointing to another column, protect
+    # the target from removal — removing it crashes PBI Desktop.
+    if tables_dir:
+        tables_path = Path(tables_dir)
+        if tables_path.is_dir():
+            # Build set of kept column keys (Used_in_PBI=1 or Used_in_Relationship=1 or Protected)
+            kept_mask = (
+                (df["Used_in_PBI"] == 1) |
+                (df["Used_in_Relationship"] == 1) |
+                (df["Protected"] == "Yes")
+            )
+            kept_keys = set(
+                (df.loc[kept_mask, "TableName"].astype(str).str.strip() + "$$" +
+                 df.loc[kept_mask, "ColumnName"].astype(str).str.strip())
+            )
+
+            # Scan TMDL files for semantic link annotations
+            # Match: \tcolumn 'Name'  or  \tcolumn Name  or  \tcolumn Name = DAX
+            col_re = re.compile(r"^\tcolumn\s+'?(.+?)'?\s*(?:=.*)?$")
+            sib_re = re.compile(r"^\t(?:column|measure|hierarchy|partition|annotation)\s")
+            sl_re = re.compile(r"^\t\tannotation\s+__PBI_SemanticLinks\s*=\s*(.+)$")
+
+            semantic_link_targets = set()  # normalized keys to protect
+            for tmdl_path in tables_path.glob("*.tmdl"):
+                tbl = tmdl_path.stem
+                content = tmdl_path.read_text(encoding="utf-8-sig")
+                lines = content.split("\n")
+                cur_col = None
+                for line in lines:
+                    cm = col_re.match(line)
+                    if cm:
+                        cur_col = cm.group(1)
+                    elif sib_re.match(line) and not line.lstrip("\t").startswith("column "):
+                        cur_col = None
+                    if cur_col is None:
+                        continue
+                    sm = sl_re.match(line)
+                    if not sm:
+                        continue
+                    source_key = f"{tbl}$${cur_col}"
+                    if source_key not in kept_keys:
+                        continue
+                    try:
+                        links = json.loads(sm.group(1).strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(links, list):
+                        links = [links]
+                    for lnk in links:
+                        target = lnk.get("LinkTarget", {})
+                        t_table = target.get("TableName", "").strip()
+                        t_item = target.get("TableItemName", "").strip()
+                        if t_table and t_item:
+                            semantic_link_targets.add(
+                                f"{t_table.lower()}$${t_item.lower()}"
+                            )
+
+            if semantic_link_targets:
+                # Apply protection to matching rows
+                sl_mask = key_norm.isin(semantic_link_targets) & (df["Remove_column"] == "Yes")
+                sl_count = sl_mask.sum()
+                if sl_count > 0:
+                    df.loc[sl_mask, "Remove_column"] = "No"
+                    df.loc[sl_mask, "Protected"] = "SemanticLink"
+                    print(f"  Protected {sl_count} column(s) targeted by __PBI_SemanticLinks")
+
+            # Scan kept calculated columns' DAX formulas for references to columns
+            # flagged for removal. If a kept calc column uses Table[Column] in its DAX,
+            # that referenced column must be protected — removing it breaks the formula
+            # and PBI Desktop shows "error in expression" for the calc column.
+            removal_keys_norm = set(key_norm[df["Remove_column"] == "Yes"])
+            if removal_keys_norm:
+                # Identify kept calculated columns (SourceColumn empty, not being removed)
+                src_col = df["SourceColumn"].fillna("").astype(str).str.strip()
+                kept_calc_mask = (
+                    (src_col == "") &
+                    (df["Remove_column"] == "No")
+                )
+                kept_calc_rows = df.loc[kept_calc_mask, ["TableName", "ColumnName"]].copy()
+                kept_calc_set = set(
+                    (r["TableName"].strip(), r["ColumnName"].strip())
+                    for _, r in kept_calc_rows.iterrows()
+                )
+
+                # Also protect columns referenced by kept MEASURES' DAX formulas.
+                # Measures have SourceColumn == "[Measure]".
+                kept_measure_mask = (
+                    (src_col == "[Measure]") &
+                    (df["Remove_column"] == "No")
+                )
+                kept_measure_rows = df.loc[kept_measure_mask, ["TableName", "ColumnName"]].copy()
+                kept_measure_set = set(
+                    (r["TableName"].strip(), r["ColumnName"].strip())
+                    for _, r in kept_measure_rows.iterrows()
+                )
+
+                if kept_calc_set or kept_measure_set:
+                    # Parse TMDL files for calc column and measure DAX formulas
+                    # \tcolumn 'Name' = DAX  (calculated column with inline DAX)
+                    calc_decl_re = re.compile(r"^\tcolumn\s+'?(.+?)'?\s*=")
+                    # \tmeasure 'Name' = DAX  (measure declaration)
+                    meas_decl_re = re.compile(r"^\tmeasure\s+'?(.+?)'?\s*=")
+                    # Table[Column] references in DAX — handles 'Table Name'[Col] and Table[Col]
+                    dax_ref_re = re.compile(r"'?(\w[\w\s]*?)'?\s*\[([^\]]+)\]")
+
+                    dax_protected = set()  # normalized keys to protect
+                    for tmdl_path in tables_path.glob("*.tmdl"):
+                        tbl = tmdl_path.stem
+                        content = tmdl_path.read_text(encoding="utf-8-sig")
+                        lines = content.split("\n")
+
+                        i = 0
+                        while i < len(lines):
+                            # Check for calculated column declaration
+                            cm = calc_decl_re.match(lines[i])
+                            is_calc = cm and (tbl, cm.group(1)) in kept_calc_set
+                            # Check for measure declaration
+                            mm = meas_decl_re.match(lines[i])
+                            is_meas = mm and (tbl, mm.group(1)) in kept_measure_set
+
+                            if is_calc or is_meas:
+                                # Collect the DAX block (declaration + indented lines)
+                                dax_lines = [lines[i]]
+                                j = i + 1
+                                while j < len(lines):
+                                    if lines[j].startswith("\t\t") or lines[j].strip() == "":
+                                        dax_lines.append(lines[j])
+                                        j += 1
+                                    else:
+                                        break
+                                dax_text = " ".join(dax_lines)
+
+                                # Find column references in DAX
+                                for ref_table, ref_col in dax_ref_re.findall(dax_text):
+                                    ref_table = ref_table.strip()
+                                    ref_col = ref_col.strip()
+                                    ref_key = f"{ref_table.lower()}$${ref_col.lower()}"
+                                    if ref_key in removal_keys_norm:
+                                        dax_protected.add(ref_key)
+
+                                i = j
+                            else:
+                                i += 1
+
+                    if dax_protected:
+                        dax_mask = key_norm.isin(dax_protected) & (df["Remove_column"] == "Yes")
+                        dax_count = dax_mask.sum()
+                        if dax_count > 0:
+                            df.loc[dax_mask, "Remove_column"] = "No"
+                            df.loc[dax_mask, "Protected"] = "DAXReference"
+                            print(f"  Protected {dax_count} column(s) referenced by kept calculated columns/measures")
+
+            # Protect hierarchy level columns: if ANY level column in a hierarchy is
+            # kept, ALL sibling level columns must be protected. PBI Desktop requires
+            # all hierarchy levels to exist — removing one breaks the drill-down.
+            # E.g. Street Hierarchy has levels Account Name, State or Province, Country.
+            # If Account Name is kept (Used_in_PBI=1), Country must also be kept.
+            hierarchy_re = re.compile(r"^\thierarchy\s+'?(.+?)'?\s*$")
+            h_col_ref_re = re.compile(r"^\t\t\tcolumn:\s*(.+)$")
+            h_sibling_re = re.compile(r"^\t(?:column|measure|hierarchy|partition|annotation)\s")
+            kept_keys_norm = set(key_norm[df["Remove_column"] == "No"])
+
+            hier_protected = set()  # normalized keys to protect
+            for tmdl_path in tables_path.glob("*.tmdl"):
+                tbl = tmdl_path.stem
+                content = tmdl_path.read_text(encoding="utf-8-sig")
+                lines = content.split("\n")
+                tbl_lower = tbl.lower()
+
+                for i, line in enumerate(lines):
+                    if hierarchy_re.match(line):
+                        # Find hierarchy block range (until next sibling or EOF)
+                        h_end = i + 1
+                        while h_end < len(lines):
+                            if h_sibling_re.match(lines[h_end]) and h_end != i:
+                                break
+                            h_end += 1
+                        # Collect all level columns in this hierarchy
+                        level_cols = []
+                        for j in range(i, h_end):
+                            hcr = h_col_ref_re.match(lines[j])
+                            if hcr:
+                                level_cols.append(hcr.group(1).strip().strip("'"))
+
+                        # Check if any level column is kept
+                        any_kept = any(
+                            f"{tbl_lower}$${c.lower()}" in kept_keys_norm
+                            for c in level_cols
+                        )
+                        if any_kept:
+                            for c in level_cols:
+                                ck = f"{tbl_lower}$${c.lower()}"
+                                if ck not in kept_keys_norm:
+                                    hier_protected.add(ck)
+
+            if hier_protected:
+                hier_mask = key_norm.isin(hier_protected) & (df["Remove_column"] == "Yes")
+                hier_count = hier_mask.sum()
+                if hier_count > 0:
+                    df.loc[hier_mask, "Remove_column"] = "No"
+                    df.loc[hier_mask, "Protected"] = "HierarchyLevel"
+                    print(f"  Protected {hier_count} column(s) as sibling hierarchy levels of kept columns")
 
     if output_xlsx_path:
         df.to_excel(output_xlsx_path, index=False)
@@ -641,6 +852,7 @@ def run_pipeline(
     views_sheet: str = "Views",
     security_sheet: str = "Security Names",
     security_file: Optional[str] = None,
+    tables_dir: Optional[str] = None,
 ):
     """Run the full 6-function optimization pipeline end-to-end.
 
@@ -654,6 +866,8 @@ def run_pipeline(
         security_sheet: Sheet name for security tables in the views_security_file
         security_file: Path to Security_Tables_Detected.xlsx from Skill 3 (optional).
             If provided, auto-detected RLS tables are merged with the manual security list.
+        tables_dir: Path to TMDL tables directory (optional). When provided, Function 5
+            scans for __PBI_SemanticLinks annotations and protects target columns.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -704,6 +918,7 @@ def run_pipeline(
         str(out / "Function5_Output.xlsx"),
         protected_view_columns=protected_view_columns,
         protected_security_tables=protected_security_tables,
+        tables_dir=tables_dir,
     )
 
     # F6: Flag tables to remove
@@ -761,6 +976,7 @@ if __name__ == "__main__":
     parser.add_argument("--schema", default="dbo", help="Database schema for DROP SQL")
     parser.add_argument("--views-sheet", default="Views", help="Sheet name for views in Views/Security file")
     parser.add_argument("--security-sheet", default="Security Names", help="Sheet name for security in Views/Security file")
+    parser.add_argument("--tables-dir", default=None, help="Path to TMDL tables directory (enables semantic link protection)")
     args = parser.parse_args()
 
     run_pipeline(
@@ -772,4 +988,5 @@ if __name__ == "__main__":
         views_sheet=args.views_sheet,
         security_sheet=args.security_sheet,
         security_file=args.security,
+        tables_dir=args.tables_dir,
     )

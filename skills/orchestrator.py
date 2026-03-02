@@ -183,6 +183,7 @@ def run_full_pipeline(
         views_sheet=views_sheet,
         security_sheet=security_sheet,
         security_file=security_path,
+        tables_dir=str(tables_dir),
     )
 
     f1, f2, f3, f4, f5, f6, kept_tables, drop_tables_df, drop_cols_df, model_cleanup_df = results
