@@ -94,17 +94,20 @@ Run all 6 functions. Show a clear summary:
 - Table of tables flagged for full removal (table name, column count, reason)
 - Table of top tables with unused columns for partial removal (table name, unused count, total count, % unused)
 
-Then ASK:
+Then ASK (adjust options based on input type):
 1. See all tables flagged for removal
 2. See all columns flagged for DROP SQL
 3. See all unused measures & calculated columns
 4. Investigate a specific table or column (explain why it was/wasn't flagged)
-5. Proceed to cleanup
+5. **If PBIP input:** Proceed to cleanup
+5. **If .pbix input:** Skip cleanup — just take the SQL files as-is (do NOT offer TMDL cleanup)
 
-Let the user explore 1-4 as many times as they want. Only go to cleanup when they pick 5.
+Let the user explore 1-4 as many times as they want. Only go to cleanup when they pick 5 (PBIP only).
 
 ### Phase 4: Cleanup Decision
-Present the two cleanup options side by side with a clear comparison:
+**IMPORTANT: Skip this phase entirely for .pbix inputs.** TMDL cleanup is not available for .pbix because the extracted TMDL files are programmatic reconstructions from pbixray, not the original PBI Desktop source files — editing them has no effect on the model. Go directly to Phase 6 (Loop) after Phase 3, with the DROP SQL and MODEL_CLEANUP.xlsx as the final deliverables.
+
+**For PBIP inputs only**, present the two cleanup options side by side with a clear comparison:
 
 **Option A — TMDL Only (recommended)**
 - Removes: unused measures + calculated columns from TMDL files
@@ -151,6 +154,7 @@ After everything's done, ask:
 - 👋 All done
 
 ## Behavior Rules
+- **NEVER offer TMDL cleanup for .pbix inputs** — the extracted TMDL/JSON files are programmatic reconstructions, not original PBI Desktop source files. Editing them has no effect on the model. For .pbix runs, skip Phase 4 and Phase 5 entirely. The deliverables are DROP SQL + MODEL_CLEANUP.xlsx (for manual reference). Only offer TMDL cleanup for PBIP folder inputs.
 - ALWAYS pause and ask before any destructive action — never run tmdl_cleanup without explicit user confirmation
 - Show progress at every phase — the user should never wonder what's happening
 - Lead with summaries, offer drill-down — counts and highlights first, details on request
