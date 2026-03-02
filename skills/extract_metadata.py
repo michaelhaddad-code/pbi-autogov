@@ -159,6 +159,45 @@ def parse_tmdl_files(tables_dir: Path) -> dict:
     return measures
 
 
+def build_column_catalog(tables_dir: Path) -> dict:
+    """Build a quick lookup of all column and measure names per table from TMDL files.
+    Returns dict of {table_name_lower: set(column_name_lower, ...)}.
+    Also returns a reverse map: {column_name_lower: [table_name, ...]}.
+    """
+    table_columns = {}  # table_lower -> set of column_lower
+    column_to_tables = {}  # column_lower -> list of table_name (original case)
+
+    if not tables_dir.is_dir():
+        return table_columns, column_to_tables
+
+    for tmdl_file in sorted(tables_dir.glob("**/*.tmdl")):
+        content = tmdl_file.read_text(encoding="utf-8-sig")
+        table_match = re.match(r"^table\s+(.+?)$", content, re.MULTILINE)
+        if not table_match:
+            continue
+        table_name = table_match.group(1).strip().strip("'")
+        table_lower = table_name.lower()
+        cols = set()
+
+        # Match column declarations: regular "\tcolumn Name" and calculated "\tcolumn Name = expr"
+        for cm in re.finditer(r"^\tcolumn\s+'?([^'=\n]+?)'?\s*(?:=.*)?$", content, re.MULTILINE):
+            col_name = cm.group(1).strip()
+            col_lower = col_name.lower()
+            cols.add(col_lower)
+            column_to_tables.setdefault(col_lower, []).append(table_name)
+
+        # Match measure declarations: "\tmeasure Name =" or "\tmeasure 'Name' ="
+        for mm in re.finditer(r"^\tmeasure\s+'?([^'=\n]+?)'?\s*=", content, re.MULTILINE):
+            meas_name = mm.group(1).strip()
+            meas_lower = meas_name.lower()
+            cols.add(meas_lower)
+            column_to_tables.setdefault(meas_lower, []).append(table_name)
+
+        table_columns[table_lower] = cols
+
+    return table_columns, column_to_tables
+
+
 def _parse_single_tmdl(filepath: Path, measures: dict):
     """Extract measure definitions from a single TMDL file."""
     content = filepath.read_text(encoding="utf-8-sig")
@@ -280,6 +319,31 @@ def _get_agg_name(func_id: int) -> str:
 # Measure dependency resolution (recursive)
 # ============================================================
 
+def _strip_dax_comments(formula: str) -> str:
+    """Remove DAX comments from a formula before parsing column references.
+    Handles single-line comments (-- ...) and block comments (/* ... */).
+    Respects string literals so -- inside "..." is not treated as a comment.
+    """
+    # First, remove block comments /* ... */ (may span multiple lines)
+    formula = re.sub(r"/\*.*?\*/", "", formula, flags=re.DOTALL)
+
+    # Then, remove single-line comments (-- to end of line),
+    # but only when the -- is not inside a string literal.
+    cleaned_lines = []
+    for line in formula.split("\n"):
+        in_string = False
+        i = 0
+        while i < len(line):
+            if line[i] == '"':
+                in_string = not in_string
+            elif line[i : i + 2] == "--" and not in_string:
+                line = line[:i]
+                break
+            i += 1
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
 def resolve_measure_dependencies(formula: str, measures_lookup: dict,
                                  visited: set = None) -> list[dict]:
     """Parse a DAX formula and identify all tables/columns it uses,
@@ -291,11 +355,15 @@ def resolve_measure_dependencies(formula: str, measures_lookup: dict,
 
     dependencies = []
 
+    # Strip DAX comments before parsing to avoid picking up
+    # commented-out column references (e.g. -- Opportunities[PipelineStep])
+    clean_formula = _strip_dax_comments(formula)
+
     # Find direct Table[Column] references
     # Pattern: 'TableName'[ColumnName] or TableName[ColumnName]
     direct_refs = re.findall(
         r"(?:'([^']+)'|([A-Za-z_][\w\s]*?))\[([^\]]+)\]",
-        formula,
+        clean_formula,
     )
     for quoted_table, unquoted_table, column in direct_refs:
         table = (quoted_table or unquoted_table).strip()
@@ -306,7 +374,7 @@ def resolve_measure_dependencies(formula: str, measures_lookup: dict,
                 dependencies.append(dep)
 
     # Find standalone [MeasureName] references (nested measures)
-    nested_refs = re.findall(r"(?<!['\w\]])\[([^\]]+)\]", formula)
+    nested_refs = re.findall(r"(?<!['\w\]])\[([^\]]+)\]", clean_formula)
 
     for ref_name in nested_refs:
         ref_name = ref_name.strip()
@@ -667,6 +735,77 @@ def extract_metadata(report_root: str, model_root: str) -> pd.DataFrame:
                 vis_count += 1
 
         print(f"      Visuals with data: {vis_count}")
+
+    # [4] Validate and remap field references against semantic model catalog
+    print(f"\n[4] Validating field references against semantic model catalog")
+    table_columns, column_to_tables = build_column_catalog(tables_dir)
+    validated_rows = []
+    remapped_count = 0
+    dropped_count = 0
+
+    for row in all_rows:
+        tbl = str(row.get("Table in the Semantic Model", "")).strip()
+        col = str(row.get("Column in the Semantic Model", "")).strip()
+        if not tbl or not col:
+            validated_rows.append(row)
+            continue
+
+        tbl_lower = tbl.lower()
+
+        # Measure rows may have comma-separated column names (e.g. "Revenue Won, Value, Status").
+        # Check if ALL individual parts exist in the catalog for this table.
+        col_parts = [c.strip().lower() for c in col.split(",")]
+        all_parts_valid = (
+            tbl_lower in table_columns
+            and all(p in table_columns[tbl_lower] for p in col_parts)
+        )
+        if all_parts_valid:
+            validated_rows.append(row)
+            continue
+
+        # For single-column references, try to find the column in other tables
+        if len(col_parts) == 1:
+            col_lower = col_parts[0]
+            candidate_tables = column_to_tables.get(col_lower, [])
+            if candidate_tables:
+                correct_table = candidate_tables[0]
+                row["Table in the Semantic Model"] = correct_table
+                validated_rows.append(row)
+                remapped_count += 1
+                print(f"    Remapped: {tbl}.{col} -> {correct_table}.{col}")
+                continue
+
+            # Column not found anywhere — stale/orphaned reference, drop it
+            dropped_count += 1
+            print(f"    Dropped stale reference: {tbl}.{col}")
+            continue
+
+        # Multi-column (measure) reference where some parts are invalid:
+        # keep only the valid parts, remap parts found in other tables
+        valid_parts = []
+        row_ok = False
+        for part in col_parts:
+            if tbl_lower in table_columns and part in table_columns[tbl_lower]:
+                valid_parts.append(part)
+                row_ok = True
+            elif part in column_to_tables:
+                valid_parts.append(part)
+                row_ok = True
+        if row_ok and valid_parts:
+            # Reconstruct with only valid column names
+            original_parts = [c.strip() for c in col.split(",")]
+            kept = [op for op in original_parts if op.strip().lower() in valid_parts]
+            row["Column in the Semantic Model"] = ", ".join(kept)
+            validated_rows.append(row)
+        else:
+            dropped_count += 1
+            print(f"    Dropped stale reference: {tbl}.{col}")
+
+    all_rows = validated_rows
+    if remapped_count or dropped_count:
+        print(f"    Remapped: {remapped_count}, Dropped stale: {dropped_count}")
+    else:
+        print(f"    All field references valid")
 
     # Build output DataFrame
     df = pd.DataFrame(all_rows, columns=[

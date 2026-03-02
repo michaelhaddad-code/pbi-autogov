@@ -103,6 +103,16 @@ def function1_report_field_usage(
     df = df.drop(columns="__col_list")
     df = df[df["Column in the Semantic Model"] != ""]
 
+    # Duplicate measure rows with UI Field Name as the column name.
+    # This ensures the measure NAME itself is tracked as a used key,
+    # not just the underlying columns the measure references.
+    if "Measure Formula" in df.columns and "UI Field Name" in df.columns:
+        measure_rows = df[df["Measure Formula"].notna() & (df["Measure Formula"].astype(str).str.strip() != "")].copy()
+        if len(measure_rows) > 0:
+            measure_rows["Column in the Semantic Model"] = measure_rows["UI Field Name"].apply(_clean_text)
+            df = pd.concat([df, measure_rows], ignore_index=True)
+            df = df[df["Column in the Semantic Model"] != ""]
+
     # Classify usage types
     usage = df["Usage (Visual/Filter/Slicer)"].str.lower()
     df["Slicer"] = usage.str.contains(r"\bslicer\b", regex=True).astype(int)
@@ -190,24 +200,80 @@ def function3_flag_columns_used_in_pbi(
     used_keys_norm = set(used_df["Key_Column_Normalized"].dropna().unique())
 
     semantic_master["Used_in_PBI"] = semantic_master["Key_Column_Normalized"].isin(used_keys_norm)
+
+    # Secondary pass: match measures by name only (PBI measure names are globally unique).
+    # Visuals may attribute a measure to a different table than its home table,
+    # creating keys like Owners$$Goal when the measure is defined in Opportunities.
+    # Name-only matching catches these cross-table references safely for measures.
+    if "SourceColumn" in semantic_master.columns:
+        is_measure = semantic_master["SourceColumn"].fillna("").astype(str).str.strip().eq("[Measure]")
+        not_yet_matched = ~semantic_master["Used_in_PBI"]
+        # Build a set of just column/measure names from F1 (the part after $$)
+        f1_col_names_norm = set()
+        for k in used_keys_norm:
+            parts = k.split("$$", 1)
+            if len(parts) == 2:
+                f1_col_names_norm.add(parts[1].strip())
+        measure_name_norm = semantic_master["ColumnName"].astype(str).str.strip().str.lower()
+        name_matched = measure_name_norm.isin(f1_col_names_norm)
+        semantic_master.loc[is_measure & not_yet_matched & name_matched, "Used_in_PBI"] = True
+
     if flag_as_int:
         semantic_master["Used_in_PBI"] = semantic_master["Used_in_PBI"].astype(int)
     else:
         semantic_master["Used_in_PBI"] = semantic_master["Used_in_PBI"].map({True: "Yes", False: "No"})
 
-    # Audit: find used keys that don't exist in the semantic model
+    # Audit: classify unmatched F1 keys into true mismatches vs display aliases.
+    # True mismatches: the column name exists in the catalog under a different table.
+    # Display aliases: the column name doesn't exist anywhere in the catalog — these
+    # are visual-level renamed measures or ad-hoc calculated fields (harmless).
     model_keys_norm = set(semantic_master["Key_Column_Normalized"].unique())
-    unmatched_used = used_df.loc[
-        ~used_df["Key_Column_Normalized"].isin(model_keys_norm),
-        ["Key_Column"],
-    ].drop_duplicates()
+
+    # Build lookup sets for classification
+    measure_names_in_catalog = set()
+    all_col_names_in_catalog = set()
+    if "SourceColumn" in semantic_master.columns:
+        measures = semantic_master[semantic_master["SourceColumn"].fillna("").astype(str).str.strip().eq("[Measure]")]
+        measure_names_in_catalog = set(measures["ColumnName"].astype(str).str.strip().str.lower())
+    all_col_names_in_catalog = set(semantic_master["ColumnName"].astype(str).str.strip().str.lower())
+
+    true_mismatches = []
+    display_aliases = []
+
+    for _, row in used_df[["Key_Column", "Key_Column_Normalized"]].drop_duplicates().iterrows():
+        knorm = row["Key_Column_Normalized"]
+        kraw = row["Key_Column"]
+
+        # Skip if fully matched by key or by measure name
+        if knorm in model_keys_norm:
+            continue
+        parts = knorm.split("$$", 1)
+        if len(parts) == 2 and parts[1].strip() in measure_names_in_catalog:
+            continue
+
+        # Unmatched — classify it
+        col_name = parts[1].strip() if len(parts) == 2 else knorm
+        if col_name in all_col_names_in_catalog:
+            # Column name exists under a different table — true mismatch
+            true_mismatches.append(kraw)
+        else:
+            # Column name doesn't exist anywhere — display alias (harmless)
+            display_aliases.append(kraw)
+
+    unmatched_used = pd.DataFrame({"Key_Column": true_mismatches}) if true_mismatches else pd.DataFrame(columns=["Key_Column"])
 
     if output_xlsx_path:
         semantic_master.to_excel(output_xlsx_path, index=False)
-        if len(unmatched_used) > 0:
+        if len(true_mismatches) > 0:
             audit_file = output_xlsx_path.replace(".xlsx", "_UNMATCHED_USED_KEYS.xlsx")
-            unmatched_used.rename(columns={"Key_Column": "Unmatched_Used_Key_Column"}).to_excel(audit_file, index=False)
-            print(f"Unmatched used keys saved to: {audit_file} (count={len(unmatched_used)})")
+            pd.DataFrame({"Unmatched_Used_Key_Column": true_mismatches}).to_excel(audit_file, index=False)
+            print(f"  True unmatched keys: {len(true_mismatches)} (saved to {audit_file})")
+        if len(display_aliases) > 0:
+            alias_file = output_xlsx_path.replace(".xlsx", "_DISPLAY_ALIASES.xlsx")
+            pd.DataFrame({"Display_Alias_Key": display_aliases}).to_excel(alias_file, index=False)
+            print(f"  Display aliases (harmless): {len(display_aliases)} (saved to {alias_file})")
+        if len(true_mismatches) == 0 and len(display_aliases) == 0:
+            print(f"  All F1 keys matched.")
         used_count = int(semantic_master["Used_in_PBI"].sum()) if flag_as_int else int((semantic_master["Used_in_PBI"] == "Yes").sum())
         print(f"Function 3 completed. Used_in_PBI count: {used_count}")
 
